@@ -1,0 +1,5 @@
+opencode.json
+.nix-local/
+result
+result-*
+bootstrap-secrets/
