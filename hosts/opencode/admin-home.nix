@@ -46,7 +46,10 @@
         command opencode attach http://127.0.0.1:${toString settings.opencodePort} \
             --dir "$directory" $argv
       '';
-      shellAbbrs.og = "sudo opencode-git";
+      shellAbbrs = {
+        ocw = "sudo opencode-workspace";
+        og = "sudo opencode-git";
+      };
     };
     git.settings.safe.directory = "${settings.workspacesRoot}/*";
   };

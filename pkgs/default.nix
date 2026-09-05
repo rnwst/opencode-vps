@@ -29,6 +29,15 @@ let
     passthru = pkgsUnstable.fish.passthru;
   };
 
+  opencode-workspace = import ./opencode-workspace {
+    inherit pkgs settings;
+    sandboxExec = sandbox-exec;
+  };
+  github-bridge = import ./github-bridge {
+    inherit pkgs settings;
+    workspaceManager = opencode-workspace;
+  };
+
   headlessXdgOpen = pkgs.writeShellApplication {
     name = "xdg-open";
     text = "exit 0";
@@ -134,11 +143,15 @@ let
         [[ $# -gt 0 ]] || { echo "usage: opencode-sandbox-exec -- COMMAND [ARG ...]" >&2; exit 64; }
       fi
 
+      # Sandbox Runtime sets TMPDIR to this path but expects the caller to
+      # create it before entering the namespace.
+      install -d -m 0700 /tmp/claude
+
       cwd="$(pwd -P)"
       root="$(${pkgs.git}/bin/git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd")"
       root="$(realpath "$root")"
       case "$root/" in
-        ${settings.workspacesRoot}/*/) ;;
+        ${settings.workspacesRoot}/?*/) ;;
         *) echo "refusing to run outside ${settings.workspacesRoot}: $root" >&2; exit 77 ;;
       esac
 
@@ -177,6 +190,9 @@ let
       jq -n \
         --arg root "$root" \
         --arg home "$HOME" \
+        --arg workspaces_root "${settings.workspacesRoot}" \
+        --arg canonical_root "${settings.githubBridge.canonicalRoot}" \
+        --arg bridge_state "${settings.githubBridge.stateRoot}" \
         --arg opencode_auth "$HOME/.local/share/opencode/auth.json" \
         --arg ssh_dir "$HOME/.ssh" \
         --arg credentials_dir "''${CREDENTIALS_DIRECTORY:-/run/credentials}" \
@@ -185,7 +201,15 @@ let
         --arg socat "${pkgs.socat}/bin/socat" \
         '{
           filesystem: {
-            denyRead: [$home, $opencode_auth, $ssh_dir, $credentials_dir],
+            denyRead: [
+              $home,
+              $opencode_auth,
+              $ssh_dir,
+              $credentials_dir,
+              $workspaces_root,
+              $canonical_root,
+              $bridge_state
+            ],
             allowRead: [$root, ($home + "/.config/git"), ($home + "/.gitconfig")],
             allowWrite: [$root, "/tmp"],
             denyWrite: []
@@ -376,7 +400,9 @@ let
   };
 
   opencode-plugin = pkgs.writeText "managed-opencode-plugin.js" ''
+    import { randomUUID } from "node:crypto"
     import { realpathSync } from "node:fs"
+    import { readFile, rename, unlink, writeFile } from "node:fs/promises"
 
     const { tool } = await import(
       Bun.resolveSync("@opencode-ai/plugin", "/home/rnwst-bot/.config/opencode"),
@@ -387,7 +413,7 @@ let
       try {
         const root = realpathSync("${settings.workspacesRoot}")
         const current = realpathSync(directory)
-        workspaceAllowed = current === root || current.startsWith(root + "/")
+        workspaceAllowed = current.startsWith(root + "/")
       } catch {}
 
       return {
@@ -397,6 +423,54 @@ let
           }
         },
         tool: {
+          ${pkgs.lib.optionalString settings.githubBridge.enable ''
+            github_track_pr: tool({
+              description: "Associate a bot-authored GitHub pull request with the current OpenCode session so future controller feedback resumes this conversation.",
+              args: {
+                pr_url: tool.schema.string().url().describe("GitHub pull request URL returned by gh pr create"),
+              },
+              async execute(args, context) {
+                const requestID = randomUUID().replaceAll("-", "")
+                const root = "${settings.githubBridge.stateRoot}"
+                const temporary = `${"$"}{root}/inbox/.request-${"$"}{requestID}.tmp`
+                const request = `${"$"}{root}/inbox/request-${"$"}{requestID}.json`
+                const response = `${"$"}{root}/responses/response-${"$"}{requestID}.json`
+                const payload = JSON.stringify({
+                  request_id: requestID,
+                  pr_url: args.pr_url,
+                  session_id: context.sessionID,
+                  directory: context.directory,
+                  agent: context.agent,
+                  expires_at: Date.now() + 120000,
+                })
+                let aborted = context.abort.aborted
+                const abort = () => { aborted = true }
+                context.abort.addEventListener("abort", abort, { once: true })
+                await writeFile(temporary, payload, { flag: "wx", mode: 0o640 })
+                await rename(temporary, request)
+
+                try {
+                  for (let attempt = 0; attempt < 600; attempt++) {
+                    if (aborted) throw new Error("PR registration cancelled")
+                    try {
+                      const result = JSON.parse(await readFile(response, "utf8"))
+                      await unlink(response)
+                      if (!result.ok) throw new Error(result.error || "PR registration failed")
+                      return `Registered ${"$"}{args.pr_url} with session ${"$"}{context.sessionID}`
+                    } catch (error) {
+                      if (error?.code !== "ENOENT") throw error
+                    }
+                    await Bun.sleep(200)
+                  }
+                  throw new Error("Timed out waiting for PR registration")
+                } finally {
+                  context.abort.removeEventListener("abort", abort)
+                  await unlink(temporary).catch(() => {})
+                  await unlink(request).catch(() => {})
+                }
+              },
+            }),
+          ''}
           ci_run: tool({
             description: "Run a GitHub Actions workflow locally with act in the isolated CI account.",
             args: {
@@ -417,8 +491,13 @@ let
 
               const child = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" })
               let output = ""
+              let truncated = false
               const publish = (text) => {
                 output += text
+                if (output.length > 100000) {
+                  output = output.slice(-100000)
+                  truncated = true
+                }
                 context.metadata({
                   title: "ci_run",
                   metadata: { output: output.slice(-30000) },
@@ -441,7 +520,8 @@ let
                 pump(child.stderr),
                 child.exited,
               ]).finally(() => context.abort.removeEventListener("abort", abort))
-              return `${"$"}{output}\n\nci_run exited with status ${"$"}{status}`
+              const prefix = truncated ? "[earlier CI output truncated]\n" : ""
+              return `${"$"}{prefix}${"$"}{output}\n\nci_run exited with status ${"$"}{status}`
             },
           }),
         },
@@ -453,12 +533,14 @@ in
   inherit
     agent-ci
     fish
+    github-bridge
     jetls
     jlfmt
     opencode
     opencode-git
     opencode-plugin
     opencode-server
+    opencode-workspace
     sandbox-exec
     ;
 }

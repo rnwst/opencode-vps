@@ -13,7 +13,9 @@
     ./disko.nix
     ./hardware-configuration.nix
     ../../modules/development.nix
+    ../../modules/github-bridge.nix
     ../../modules/opencode.nix
+    ../../modules/opencode-workspaces.nix
     ../../modules/ci-runner.nix
   ];
 
@@ -21,6 +23,19 @@
     {
       assertion = settings.operatorKeys != [ ];
       message = "Configure settings.operatorKeys with at least one SSH public key before deployment.";
+    }
+    {
+      assertion = settings.githubBridge.maxConcurrentTasks > 0;
+      message = "githubBridge.maxConcurrentTasks must be positive.";
+    }
+    {
+      assertion =
+        settings.githubBridge.minimumFreePercent > 0 && settings.githubBridge.minimumFreePercent < 100;
+      message = "githubBridge.minimumFreePercent must be between 1 and 99.";
+    }
+    {
+      assertion = settings.githubBridge.retentionDays > 0;
+      message = "githubBridge.retentionDays must be positive.";
     }
   ];
 
@@ -90,7 +105,10 @@
         isNormalUser = true;
         description = "OpenCode host administrator";
         shell = localPackages.fish;
-        extraGroups = [ "wheel" ];
+        extraGroups = [
+          "agent-workspaces"
+          "wheel"
+        ];
         openssh.authorizedKeys.keys = settings.operatorKeys;
       };
 

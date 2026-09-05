@@ -45,7 +45,7 @@ let
           "/nix/store/**" = "allow";
         };
       };
-      plugin = [ "file:///etc/opencode/plugins/ci-runner.js" ];
+      plugin = [ "file:///etc/opencode/plugins/managed-host.js" ];
       server = {
         cors = [ "https://${settings.publicHostName}" ];
         hostname = "127.0.0.1";
@@ -66,7 +66,7 @@ in
     etc = {
       "opencode/AGENTS.md".source = agentsFile;
       "opencode/opencode.json".source = managedConfig;
-      "opencode/plugins/ci-runner.js".source = localPackages.opencode-plugin;
+      "opencode/plugins/managed-host.js".source = localPackages.opencode-plugin;
     };
     systemPackages = [
       localPackages.opencode-git
@@ -123,7 +123,12 @@ in
           "/home/rnwst-bot"
           "/var/lib/ci-runner/jobs"
           settings.workspacesRoot
+        ]
+        ++ lib.optionals settings.githubBridge.enable [
+          "${settings.githubBridge.stateRoot}/inbox"
+          "${settings.githubBridge.stateRoot}/responses"
         ];
+        SupplementaryGroups = lib.optionals settings.githubBridge.enable [ "github-bridge-register" ];
         RestrictAddressFamilies = [
           "AF_INET"
           "AF_INET6"

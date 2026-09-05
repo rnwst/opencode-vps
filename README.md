@@ -25,6 +25,8 @@ flake.
   privileged Docker sockets, SSH, and persistent project-supplied plugins.
 - Run GitHub Actions in disposable copies under a credential-free account and
   rootless Docker, never the OpenCode account or rootful Docker.
+- Route controller-authorized GitHub assignments, reviews, and mentions into
+  persistent OpenCode sessions without public webhook infrastructure.
 - Keep credentials and installation-specific values out of the Nix store and
   Git history.
 
@@ -32,7 +34,7 @@ flake.
 
 | Component      | Design                                                                                     |
 | -------------- | ------------------------------------------------------------------------------------------ |
-| Base system    | NixOS 26.05, x86-64, GPT with BIOS and EFI boot, ext4 root, 25% zram                       |
+| Base system    | NixOS 26.05, x86-64, GPT with BIOS and EFI boot, compressed Btrfs root, 25% zram           |
 | Public ingress | Cloudflare Tunnel to OpenCode on `127.0.0.1:4096`                                          |
 | Host firewall  | TCP 22 only; port 4096 is loopback-only                                                    |
 | `rnwst-admin`  | Primary operator with passwordless sudo and the full development profile                   |
@@ -41,6 +43,8 @@ flake.
 | OpenCode       | Pinned package, HTTP Basic Auth, OpenAI provider, sharing/snapshots/autoupdate disabled    |
 | Agent commands | Managed shell wrapper, Sandbox Runtime, bubblewrap, curated egress, worktree-only writes   |
 | GitHub         | Root-owned token for operators; masked API and Git HTTPS authentication for agents         |
+| GitHub bridge  | Conditional notification polling, numeric controller-ID checks, persistent session routing |
+| Task storage   | Canonical Btrfs repositories with cheap, independent writable task snapshots                |
 | Configuration  | Managed `/etc/opencode/opencode.json` and `/etc/opencode/AGENTS.md`                        |
 
 OpenCode project configuration and project plugins are disabled. This prevents
@@ -89,6 +93,16 @@ operate on a disposable copy rather than the source worktree. `ci-runner`
 uses only its own rootless Docker socket; rootful Docker is disabled, and agent
 shell commands cannot create Unix sockets.
 
+Canonical repositories live outside the workspace tree under
+`/var/lib/opencode-task-bases`. Every automated GitHub task receives a writable
+Btrfs snapshot under `/srv/opencode/workspaces/.tasks`; unchanged repository
+history and working files share disk extents. Canonical repositories are fetched
+under a per-repository lock before every snapshot. Manual workspaces remain
+directly below `/srv/opencode/workspaces` and are never collected automatically.
+Automated names remain unique while identifying their GitHub subject, for
+example `task-rnwst-fish-helix-pr-6-5eeebd5902cc`. OpenCode clients use this
+directory basename as the workspace label.
+
 ## Repository Layout
 
 | Path                                        | Purpose                                                          |
@@ -102,8 +116,14 @@ shell commands cannot create Unix sockets.
 | `hosts/opencode/home.nix`                   | Bot-specific Git identity and HTTPS credential helper            |
 | `hosts/opencode/admin-home.nix`             | Administrator identity plus `og` and `oca` operator helpers       |
 | `modules/opencode.nix`                      | Managed OpenCode, systemd credentials, and Cloudflare Tunnel     |
+| `modules/github-bridge.nix`                 | GitHub polling, credentials, queue activation, and service policy |
+| `modules/opencode-workspaces.nix`           | Btrfs workspace storage and operator tooling                     |
 | `modules/ci-runner.nix`                     | Rootless Docker and restricted sudo rule                         |
 | `pkgs/default.nix`                          | Sandbox, operator Git, server, CI, and development wrappers       |
+| `pkgs/github-bridge/`                       | GitHub event routing, SQLite state, and OpenCode API client       |
+| `pkgs/opencode-workspace/`                  | Canonical repositories and Btrfs workspace manager               |
+| `tests/github-bridge/`                      | Side-effect-free bridge unit and fake-HTTP tests                  |
+| `tests/nixos/github-bridge.nix`             | Real OpenCode and Btrfs NixOS VM test                             |
 | `config/AGENTS.md`                          | Nix-managed host instructions presented to OpenCode              |
 
 ## Prerequisites
@@ -185,6 +205,40 @@ secret paths. Replace every template value before deployment. These identifiers
 are not credentials, but they can identify a live host; do not commit them if
 that association should remain private.
 
+`githubBridge` selects one agent and model for all GitHub-triggered work. The
+committed configuration uses `dryRun = false`, so newly discovered commands are
+processed after the initial notification baseline. Set it to `true` before
+deployment when proposed actions should be reviewed first. The initial defaults
+allow four concurrent automated tasks, require 15 percent free space, and retain
+completed task snapshots for 30 days.
+
+To list models available to the bot account, run:
+
+```bash
+sudo -iu rnwst-bot opencode models
+```
+
+Each result has the form `<PROVIDER_ID>/<MODEL_ID>`. Set the corresponding
+values in `githubBridge.model`:
+
+```nix
+model = {
+  providerID = "openai";
+  modelID = "gpt-5.6-sol";
+};
+```
+
+Rebuild the host and run the bridge once after changing the model:
+
+```bash
+sudo nixos-rebuild switch --flake .#opencode
+sudo systemctl start github-bridge.service
+```
+
+The bridge validates that exact provider/model pair before allocating a task
+workspace, so an unavailable model leaves the GitHub event pending rather than
+silently using a fallback.
+
 ## 2. Create the Cloudflare Tunnel
 
 Run this on the trusted workstation with `cloudflared` installed:
@@ -230,13 +284,15 @@ Configure the classic token as follows:
   such as 30 or 90 days.
 - Grant `public_repo` for public repositories, or `repo` only when private
   repository access is required.
+- Grant `notifications` so the bridge can discover assignments, review
+  requests, and mentions without changing notification read state.
 - Grant `workflow` only if the agent must add or modify files under
   `.github/workflows`.
 
 Do not grant `admin:org`, `admin:public_key`, `admin:repo_hook`, `delete_repo`,
-`gist`, `notifications`, package, or `user` scopes unless a specific task
-requires them. Use a GitHub App instead of a classic PAT for a long-lived or
-centrally managed multi-organization integration.
+`gist`, package, or `user` scopes unless a specific task requires them. Use a
+GitHub App instead of a classic PAT for a long-lived or centrally managed
+multi-organization integration.
 
 Create the token file without putting the token in shell history, then paste
 only the token into the editor:
@@ -244,7 +300,25 @@ only the token into the editor:
 ```bash
 install -m 0600 /dev/null bootstrap-secrets/github-token
 $EDITOR bootstrap-secrets/github-token
+
+# Resolve the immutable numeric ID; do not use the account's login name here.
+gh api users/<CONTROLLER_LOGIN> --jq .id \
+  > bootstrap-secrets/github-controller-id
+
+# The public user endpoint also works without GitHub CLI authentication.
+curl --fail --silent --show-error \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: opencode-vps-bootstrap' \
+  https://api.github.com/users/<CONTROLLER_LOGIN> \
+  | jq -er '.id | numbers' \
+  > bootstrap-secrets/github-controller-id
+
+chmod 0600 bootstrap-secrets/github-controller-id
 ```
+
+The controller ID is not secret, but keeping it in a runtime file avoids tying
+the public template to one GitHub identity. The bridge authorizes commands by
+this immutable numeric ID, never by login name or notification reason.
 
 The token is exposed to agent commands only as a Sandbox Runtime sentinel and
 is restored only for GitHub HTTPS requests. CI jobs never receive it. Record
@@ -384,8 +458,8 @@ installation.
 
 ## 6. Install Runtime Secrets
 
-The first boot is intentionally usable over SSH even though OpenCode and the
-tunnel fail closed until their credential files exist.
+The first boot is intentionally usable over SSH even though OpenCode, the
+GitHub bridge, and the tunnel fail closed until their credential files exist.
 
 Copy the prepared files to the administrator's home, install them with root
 ownership, then remove the transfer copies:
@@ -393,6 +467,7 @@ ownership, then remove the transfer copies:
 ```bash
 scp bootstrap-secrets/server-password \
   bootstrap-secrets/github-token \
+  bootstrap-secrets/github-controller-id \
   bootstrap-secrets/cloudflared.json \
   rnwst-admin@<VPS_IP>:/tmp/
 ```
@@ -402,9 +477,11 @@ ssh rnwst-admin@<VPS_IP>
 sudo install -d -m 0700 -o root -g root /var/lib/opencode-secrets
 sudo install -m 0400 -o root -g root /tmp/server-password /var/lib/opencode-secrets/server-password
 sudo install -m 0400 -o root -g root /tmp/github-token /var/lib/opencode-secrets/github-token
+sudo install -m 0400 -o root -g root /tmp/github-controller-id /var/lib/opencode-secrets/github-controller-id
 sudo install -m 0400 -o root -g root /tmp/cloudflared.json /var/lib/opencode-secrets/cloudflared.json
-rm -f /tmp/server-password /tmp/github-token /tmp/cloudflared.json
+rm -f /tmp/server-password /tmp/github-token /tmp/github-controller-id /tmp/cloudflared.json
 sudo systemctl restart opencode.service
+sudo systemctl restart github-bridge.timer
 sudo systemctl restart cloudflared-tunnel-<TUNNEL_UUID>.service
 ```
 
@@ -525,6 +602,109 @@ Test `ci_run` on a small repository with a known workflow. Confirm its output
 streams in the tool UI, the source worktree remains unchanged, and no
 `/var/lib/ci-runner/jobs/job.*` directory remains afterward.
 
+## GitHub Bridge
+
+The bridge polls GitHub Notifications because repository webhooks require admin
+access and GitHub App webhooks only cover repositories where the App is
+installed. Notifications are discovery hints only. Before acting, the bridge
+fetches the underlying event and verifies its actor, assigner, review requester,
+or author against the numeric controller ID. It does not mark notifications
+read.
+
+GitHub may publish a notification shortly after its underlying comment or review.
+After the initial hard baseline, the bridge allows up to five minutes of bounded
+notification propagation delay so fresh commands are not mistaken for historical
+activity. Older previously unseen events remain baselined.
+
+The bridge accepts one command anywhere in a controller-authored comment. Text
+before the mention is not part of the instruction; the action and all following
+text are. Additional instruction text is optional, and multiple commands in one
+comment are rejected as ambiguous:
+
+```text
+@rnwst-bot answer [additional instruction]
+@rnwst-bot implement [additional instruction]
+@rnwst-bot review [additional instruction]
+@rnwst-bot continue [additional instruction]
+@rnwst-bot cancel
+```
+
+| Command     | Issue                             | Pull request                                            | Discussion                               |
+| ----------- | --------------------------------- | ------------------------------------------------------- | ---------------------------------------- |
+| `answer`    | Answer the issue question         | Post an explanatory PR comment                          | Answer the Discussion                    |
+| `implement` | Implement the issue and open a PR | Implement requested PR changes or create a follow-up PR | Implement the proposal and open a PR     |
+| `review`    | Review the proposal and comment   | Review code and submit a `COMMENT` review               | Review the proposal and answer           |
+| `continue`  | Resume the active mapped session  | Resume the active implementation session                | Resume the active answer or task session |
+| `cancel`    | Cancel queued and ongoing work    | Cancel queued and ongoing work                          | Cancel queued and ongoing work           |
+
+| Automatic trigger                    | Verification                                                              | Action      |
+| ------------------------------------ | ------------------------------------------------------------------------- | ----------- |
+| Bot assigned to an issue             | Controller performed the assignment and the bot remains assigned         | `implement` |
+| Bot requested as a PR reviewer       | Controller requested the review and the request remains active           | `review`    |
+| Controller submits a tracked PR review | Review author matches the controller; pending reviews remain ignored    | `continue`  |
+
+`answer`, `implement`, and `review` always create a new task snapshot and
+OpenCode session. The new session becomes the active mapping for that GitHub
+subject without deleting older sessions. `continue` resumes the active mapping;
+`cancel` aborts current work and pauses that mapping, and a later `continue`
+resumes it. A session may be linked explicitly to several subjects, such as an
+issue and its implementation PR. Either linked subject can continue that same
+session. Mappings are never inferred merely because subjects share a repository.
+If trusted review feedback arrives for a bot-authored PR before registration,
+the bridge waits five minutes for the original session to register. If no
+mapping appears, it creates a replacement implementation session so feedback is
+not stranded after state loss or an interrupted registration.
+
+After creating a PR, the agent calls `github_track_pr` with the returned URL.
+The tool obtains the current session and directory from OpenCode, verifies that
+the bot authored the PR, and makes that session active for future PR feedback.
+
+Initial bridge prompts contain only the subject URL, title, body, prepared
+checkout, and verified controller instruction. PR reviews do not include a full
+diff; issue comments, Discussion replies, other users' reviews, and complete CI
+logs are not copied by default. Agents inspect local diffs and use targeted `gh`
+or GraphQL requests when the controller references additional context.
+
+Comments and submitted reviews use their stable GitHub object ID for
+deduplication. Immediately before every new-session or continuation prompt, the
+bridge re-fetches that exact object, revalidates its controller, updates SQLite,
+and formats the latest content as Markdown sections and bullets. If the command,
+PR head, or authorization changed while a workspace was being prepared, the
+bridge safely retries or discards the pending action. Once the deterministic
+OpenCode message exists, processing has started and later edits are intentionally
+ignored; submit a new comment or review to provide additional instructions.
+
+The committed configuration starts the bridge in live mode. For a dry-run
+rollout, set `githubBridge.dryRun = true` and rebuild before allowing the bridge
+to poll. Dry-run mode still polls notifications, re-fetches the underlying
+GitHub objects, verifies the controller's numeric user ID, records state, and
+logs authorized proposed actions. It does not create task workspaces, create or
+prompt OpenCode sessions, execute commands, or collect old tasks. The initial
+poll baselines existing notifications, and events observed as dry-run are not
+replayed after activation; submit a new command after enabling the bridge when
+an action should run. Inspect proposed actions and local state:
+
+```bash
+sudo systemctl start github-bridge.service
+sudo journalctl -u github-bridge --no-pager
+sudo github-bridge status
+```
+
+After reviewing dry-run behavior, set `githubBridge.dryRun = false`, rebuild,
+and start the service again. The persisted baseline prevents existing unread
+notifications from unexpectedly starting historical work. When deploying the
+committed live default directly, verify that the first baseline poll completes
+before creating a new actionable comment, assignment, or review request.
+
+No separate automation reacts to failed checks or merge conflicts. Agents run
+`ci_run` before finishing; later remote-only failures or conflicts can be sent
+back to the mapped session explicitly:
+
+```text
+@rnwst-bot continue Fix the failing remote checks.
+@rnwst-bot continue Rebase this branch and resolve the conflicts.
+```
+
 ## Clients And Sessions
 
 ### TUI On The VPS
@@ -563,30 +743,75 @@ a privileged third-party client.
 
 ## Daily Operation
 
-Create repositories below the workspace root with the operator wrapper:
+Create a manual workspace from an existing GitHub repository, then attach
+OpenCode:
 
-```bash
-opencode-git clone \
-  https://github.com/<OWNER>/<REPOSITORY>.git \
-  <REPOSITORY>
+```fish
+ocw create <OWNER>/<REPOSITORY> [WORKSPACE_NAME]
+oca <WORKSPACE_NAME>
 ```
 
-The relative destination is created below `/srv/opencode/workspaces` and owned
-by `rnwst-bot`. Admin can inspect and edit workspace files directly with the
-shared development profile. Use normal `git` for local operations such as
-status and diff. Agent GitHub operations use the masked HTTPS credential;
-administrators use `og -C <REPOSITORY> pull` or push when GitHub credentials
-are required. Open or select the workspace in the OpenCode web UI, then sync
-projects in mobile clients.
+`ocw` abbreviates `sudo opencode-workspace`. The manager fetches the canonical
+repository unconditionally and creates a writable Btrfs snapshot. Manual
+workspaces are not subject to automated task cleanup.
+
+Start without a remote and attach or publish one later:
+
+```fish
+ocw init my-project
+oca my-project
+
+ocw set-remote my-project <OWNER>/<EXISTING_REPOSITORY>
+ocw publish my-project <OWNER>/<NEW_REPOSITORY>
+ocw publish internal-project <ORGANIZATION>/<NEW_REPOSITORY> --visibility private
+```
+
+`publish` defaults to public visibility. It creates the GitHub repository, adds
+the HTTPS origin, and pushes the current branch when commits exist. Other
+workspace-manager commands are:
+
+```fish
+ocw list
+ocw refresh <OWNER>/<REPOSITORY>
+ocw remove <WORKSPACE_NAME>
+```
+
+Removal refuses dirty workspaces or commits not known to a remote. Admin can
+inspect and edit workspace files directly with the shared development profile.
+Use normal `git` for local operations; agent GitHub operations use the masked
+HTTPS credential, while administrators may use `og` when explicit operator
+credentials are required. Open or select the workspace in the OpenCode web UI,
+then sync projects in mobile clients.
 
 Useful operator commands:
 
 ```bash
 sudo systemctl status opencode
+sudo systemctl status github-bridge.timer
 sudo journalctl -fu opencode
+sudo journalctl -fu github-bridge
 sudo journalctl -fu cloudflared-tunnel-<TUNNEL_UUID>
+sudo github-bridge status --blocked
 sudo -u ci-runner env XDG_RUNTIME_DIR=/run/user/$(id -u ci-runner) systemctl --user status docker
 ```
+
+Completed automated task snapshots are collected after 30 days only when the
+worktree is clean, commits are reachable from a remote, the session is idle,
+and no feedback remains queued. Dirty or unpushed tasks remain present and
+appear in `github-bridge status --blocked`. OpenCode sessions and bridge records
+are retained indefinitely, so a collected task can be recreated at its original
+path when late feedback arrives.
+
+Review old sessions before coordinated deletion:
+
+```bash
+sudo github-bridge sessions --older-than 1y
+sudo github-bridge delete-session <SESSION_ID>
+sudo github-bridge delete-sessions --older-than 1y --confirm
+```
+
+These commands remove the OpenCode session and associated automated task state;
+they never remove manual workspaces.
 
 Deploy reviewed configuration changes from a checkout on the VPS:
 
@@ -658,7 +883,8 @@ password.
 
 If OpenCode does not start, inspect `journalctl -u opencode`. Missing
 `server-password` or `github-token` credentials are expected to stop the unit.
-Reinstall the file with mode `0400`, root ownership, and restart the unit.
+If the bridge fails, also verify `github-controller-id`. Reinstall the file with
+mode `0400`, root ownership, and restart the corresponding unit.
 
 If the tunnel does not start, verify that the UUID in settings matches the
 credential JSON and inspect the corresponding cloudflared unit. Set
@@ -714,7 +940,8 @@ Validate every tooling change:
 ```bash
 nix fmt
 nix flake check
-nix build .#agent-ci .#opencode-git .#sandbox-exec .#opencode-server
+nix build .#agent-ci .#github-bridge .#opencode-git \
+  .#opencode-workspace .#sandbox-exec .#opencode-server
 ```
 
 Do not install persistent system tools with `curl | sh`, `npm -g`, rootful

@@ -17,10 +17,26 @@
   opencodePort = 4096;
   workspacesRoot = "/srv/opencode/workspaces";
 
+  githubBridge = {
+    enable = true;
+    dryRun = false;
+    agent = "build";
+    model = {
+      providerID = "openai";
+      modelID = "gpt-5.6-sol";
+    };
+    maxConcurrentTasks = 4;
+    minimumFreePercent = 15;
+    retentionDays = 30;
+    canonicalRoot = "/var/lib/opencode-task-bases";
+    stateRoot = "/var/lib/opencode-github-bridge";
+  };
+
   secrets = {
     directory = "/var/lib/opencode-secrets";
     cloudflareCredentials = "/var/lib/opencode-secrets/cloudflared.json";
     serverPassword = "/var/lib/opencode-secrets/server-password";
     githubToken = "/var/lib/opencode-secrets/github-token";
+    githubControllerId = "/var/lib/opencode-secrets/github-controller-id";
   };
 }

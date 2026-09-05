@@ -26,13 +26,16 @@
           size = "100%";
           priority = 3;
           content = {
-            type = "filesystem";
-            format = "ext4";
-            mountpoint = "/";
-            mountOptions = [
-              "defaults"
-              "noatime"
-            ];
+            type = "btrfs";
+            extraArgs = [ "-f" ];
+            subvolumes."/@root" = {
+              mountpoint = "/";
+              mountOptions = [
+                "compress=zstd:1"
+                "noatime"
+                "space_cache=v2"
+              ];
+            };
           };
         };
       };

@@ -72,7 +72,13 @@
         default = localPackages.agent-ci;
       };
 
-      checks.${system}.nixos = self.nixosConfigurations.opencode.config.system.build.toplevel;
+      checks.${system} = {
+        github-bridge = import ./tests/github-bridge { inherit pkgs; };
+        github-bridge-vm = import ./tests/nixos/github-bridge.nix {
+          inherit localPackages pkgs;
+        };
+        nixos = self.nixosConfigurations.opencode.config.system.build.toplevel;
+      };
 
       formatter.${system} = pkgs.nixfmt-tree;
 
@@ -80,6 +86,7 @@
         packages = with pkgs; [
           deadnix
           nixfmt
+          ruff
           statix
         ];
       };
