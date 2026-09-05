@@ -234,6 +234,26 @@ pkgs.testers.nixosTest {
     machine.succeed("opencode-workspace remove removable-project")
     machine.fail("test -e /srv/opencode/workspaces/removable-project")
 
+    machine.succeed("opencode-workspace remove cloned-one > /tmp/remove-output 2>&1")
+    machine.succeed("grep -q 'fetching remote refs into a temporary repository' /tmp/remove-output")
+    machine.succeed("grep -q 'Removed workspace: /srv/opencode/workspaces/cloned-one' /tmp/remove-output")
+    machine.fail("grep -Eq 'Cloning into|^From |^remote:|^error:' /tmp/remove-output")
+
+    machine.succeed("opencode-workspace init force-project")
+    machine.succeed(
+      "runuser -u rnwst-bot -- git -C /srv/opencode/workspaces/force-project "
+      "-c user.name=Test -c user.email=test@example.com commit --allow-empty -m local-only"
+    )
+    machine.fail("opencode-workspace remove force-project")
+    machine.succeed("opencode-workspace remove force-project --force > /tmp/force-output")
+    machine.succeed("grep -q 'Skipping cleanliness and remote commit verification' /tmp/force-output")
+    machine.fail("test -e /srv/opencode/workspaces/force-project")
+
+    machine.succeed("opencode-workspace init dirty-force-project")
+    machine.succeed("touch /srv/opencode/workspaces/dirty-force-project/untracked")
+    machine.succeed("opencode-workspace remove dirty-force-project --force")
+    machine.fail("test -e /srv/opencode/workspaces/dirty-force-project")
+
     machine.succeed("opencode-workspace init public-project")
     machine.succeed("runuser -u rnwst-bot -- git -C /srv/opencode/workspaces/public-project -c user.name=Test -c user.email=test@example.com commit --allow-empty -m initial")
     machine.succeed(f"{workspace_env} opencode-workspace publish public-project owner/public-project")

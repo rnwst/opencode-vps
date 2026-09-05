@@ -29,7 +29,7 @@ usage:
   opencode-workspace publish WORKSPACE_NAME OWNER/REPOSITORY [--visibility public|private]
   opencode-workspace list
   opencode-workspace refresh OWNER/REPOSITORY
-  opencode-workspace remove WORKSPACE_NAME
+  opencode-workspace remove WORKSPACE_NAME [--force]
   opencode-workspace prepare-task TASK_ID OWNER/REPOSITORY ACTION SUBJECT_NUMBER REF
   opencode-workspace restore-task TASK_ID OWNER/REPOSITORY ACTION SUBJECT_NUMBER REF
   opencode-workspace head-task TASK_ID
@@ -155,10 +155,10 @@ remote_contains_head() {
     fi
     verify="$(mktemp -d)"
     chown "$bot_user:$bot_group" "$verify"
-    git_as_bot init --bare "$verify" >/dev/null
-    if git_as_bot -C "$verify" fetch --no-tags --prune -- "$url" \
-      '+refs/heads/*:refs/remotes/verify/*' >/dev/null &&
-      git_as_bot -C "$verify" branch -r --contains "$head" | grep -q .; then
+    git_as_bot init --bare --quiet "$verify"
+    if git_as_bot -C "$verify" fetch --quiet --no-tags --prune -- "$url" \
+      '+refs/heads/*:refs/remotes/verify/*' >/dev/null 2>&1 &&
+      git_as_bot -C "$verify" branch -r --contains "$head" 2>/dev/null | grep -q .; then
       rm -rf "$verify"
       return 0
     fi
@@ -406,16 +406,28 @@ command_refresh() {
 }
 
 command_remove() {
-  (( $# == 1 )) || usage
+  (( $# >= 1 && $# <= 2 )) || usage
+  local force=false
+  if (( $# == 2 )); then
+    [[ "$2" == "--force" ]] || usage
+    force=true
+  fi
   manual_path "$1"
   [[ -d "$workspace_path/.git" ]] || die "manual workspace is not a Git repository"
-  [[ -z "$(sandbox_git_status "$workspace_path")" ]] ||
-    die "workspace has uncommitted changes"
-  if sandbox_git "$workspace_path" 'git rev-parse --verify HEAD' >/dev/null 2>&1; then
-    read_token
-    remote_contains_head "$workspace_path" || die "workspace has commits not known to a remote"
+  if [[ "$force" == true ]]; then
+    printf 'Skipping cleanliness and remote commit verification because --force was supplied.\n'
+  else
+    [[ -z "$(sandbox_git_status "$workspace_path")" ]] ||
+      die "workspace has uncommitted changes"
+    if sandbox_git "$workspace_path" 'git rev-parse --verify HEAD' >/dev/null 2>&1; then
+      printf 'Verifying recoverability before deletion by fetching remote refs into a temporary repository.\n'
+      read_token
+      remote_contains_head "$workspace_path" ||
+        die "workspace has commits not known to a remote; push them or use --force"
+    fi
   fi
   btrfs subvolume delete "$workspace_path" >/dev/null
+  printf 'Removed workspace: %s\n' "$workspace_path"
 }
 
 command_prepare_task() {

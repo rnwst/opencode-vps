@@ -774,10 +774,16 @@ workspace-manager commands are:
 ocw list
 ocw refresh <OWNER>/<REPOSITORY>
 ocw remove <WORKSPACE_NAME>
+ocw remove <WORKSPACE_NAME> --force
 ```
 
-Removal refuses dirty workspaces or commits not known to a remote. Admin can
-inspect and edit workspace files directly with the shared development profile.
+By default, removal refuses dirty workspaces and explains that it is fetching
+into a temporary bare repository to verify every commit remains recoverable from
+a configured remote; it never updates the workspace being deleted. `--force`
+skips both cleanliness and remote-reachability checks, immediately deleting the
+validated manual Git workspace even when it contains uncommitted changes or
+unpushed commits. Admin can inspect and edit workspace files directly with the
+shared development profile.
 Use normal `git` for local operations; agent GitHub operations use the masked
 HTTPS credential, while administrators may use `og` when explicit operator
 credentials are required. Open or select the workspace in the OpenCode web UI,
