@@ -143,10 +143,6 @@ let
         [[ $# -gt 0 ]] || { echo "usage: opencode-sandbox-exec -- COMMAND [ARG ...]" >&2; exit 64; }
       fi
 
-      # Sandbox Runtime sets TMPDIR to this path but expects the caller to
-      # create it before entering the namespace.
-      install -d -m 0700 /tmp/claude
-
       cwd="$(pwd -P)"
       root="$(${pkgs.git}/bin/git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd")"
       root="$(realpath "$root")"
@@ -155,7 +151,38 @@ let
         *) echo "refusing to run outside ${settings.workspacesRoot}: $root" >&2; exit 77 ;;
       esac
 
-      settings_file="$(mktemp)"
+      relative="''${root#${settings.workspacesRoot}/}"
+      case "$relative" in
+        .tasks/*)
+          workspace_name="''${relative#.tasks/}"
+          [[ "$workspace_name" != */* ]] || { echo "invalid automated workspace root: $root" >&2; exit 77; }
+          workspace_tmp="${settings.workspacesTmpRoot}/.tasks/$workspace_name"
+          ;;
+        *)
+          [[ "$relative" != */* ]] || { echo "invalid manual workspace root: $root" >&2; exit 77; }
+          workspace_tmp="${settings.workspacesTmpRoot}/$relative"
+          ;;
+      esac
+      session_id="''${OPENCODE_SESSION_ID:-ses_cli}"
+      [[ "$session_id" =~ ^ses_[A-Za-z0-9]+$ ]] || { echo "invalid OpenCode session ID" >&2; exit 77; }
+      [[ -d "$workspace_tmp" && ! -L "$workspace_tmp" ]] || {
+        echo "temporary root is unavailable for workspace: $root" >&2
+        exit 77
+      }
+      session_tmp="$workspace_tmp/$session_id"
+      if [[ -e "$session_tmp" ]]; then
+        [[ -d "$session_tmp" && ! -L "$session_tmp" ]] || {
+          echo "invalid session temporary directory: $session_tmp" >&2
+          exit 77
+        }
+      else
+        install -d -m 0700 "$session_tmp"
+      fi
+      chmod 0700 "$session_tmp"
+      install -d -m 0700 "$session_tmp/claude"
+
+      settings_file="$(mktemp "$session_tmp/.srt-settings.XXXXXXXXXX")"
+      settings_inside="/tmp/''${settings_file##*/}"
       trap 'rm -f "$settings_file"' EXIT
 
       if [[ "$mode" == "shell" && -n "''${CREDENTIALS_DIRECTORY:-}" && -r "$CREDENTIALS_DIRECTORY/github-token" ]]; then
@@ -191,6 +218,7 @@ let
         --arg root "$root" \
         --arg home "$HOME" \
         --arg workspaces_root "${settings.workspacesRoot}" \
+        --arg workspaces_tmp_root "${settings.workspacesTmpRoot}" \
         --arg canonical_root "${settings.githubBridge.canonicalRoot}" \
         --arg bridge_state "${settings.githubBridge.stateRoot}" \
         --arg opencode_auth "$HOME/.local/share/opencode/auth.json" \
@@ -207,6 +235,7 @@ let
               $ssh_dir,
               $credentials_dir,
               $workspaces_root,
+              $workspaces_tmp_root,
               $canonical_root,
               $bridge_state
             ],
@@ -291,7 +320,16 @@ let
           git: { safeDirectories: [$root] }
         }' > "$settings_file"
 
-      ${pkgsUnstable.sandbox-runtime}/bin/srt --settings "$settings_file" -- "$@"
+      ${pkgs.bubblewrap}/bin/bwrap \
+        --die-with-parent \
+        --new-session \
+        --ro-bind / / \
+        --dev-bind /dev /dev \
+        --proc /proc \
+        --bind "$root" "$root" \
+        --bind "$session_tmp" /tmp \
+        --chdir "$cwd" \
+        -- ${pkgsUnstable.sandbox-runtime}/bin/srt --settings "$settings_inside" -- "$@"
     '';
   };
 
@@ -402,7 +440,7 @@ let
   opencode-plugin = pkgs.writeText "managed-opencode-plugin.js" ''
     import { randomUUID } from "node:crypto"
     import { realpathSync } from "node:fs"
-    import { readFile, rename, unlink, writeFile } from "node:fs/promises"
+    import { readFile, rename, rm, unlink, writeFile } from "node:fs/promises"
 
     const { tool } = await import(
       Bun.resolveSync("@opencode-ai/plugin", "/home/rnwst-bot/.config/opencode"),
@@ -410,16 +448,50 @@ let
 
     export const ManagedHost = async ({ directory }) => {
       let workspaceAllowed = false
+      let workspaceTmp
       try {
         const root = realpathSync("${settings.workspacesRoot}")
         const current = realpathSync(directory)
         workspaceAllowed = current.startsWith(root + "/")
+        const relative = current.slice(root.length + 1)
+        if (relative.startsWith(".tasks/")) {
+          const task = relative.slice(".tasks/".length)
+          if (task && !task.includes("/")) {
+            workspaceTmp = `${settings.workspacesTmpRoot}/.tasks/''${task}`
+          }
+        } else if (relative && !relative.includes("/")) {
+          workspaceTmp = `${settings.workspacesTmpRoot}/''${relative}`
+        }
       } catch {}
 
+      const tmpPathKeys = {
+        edit: "filePath",
+        glob: "path",
+        grep: "path",
+        read: "filePath",
+        write: "filePath",
+      }
+      const isTmpPath = (value) =>
+        typeof value === "string" && (value === "/tmp" || value.startsWith("/tmp/"))
+
       return {
-        "tool.execute.before": async () => {
+        event: async (input) => {
+          if (input.event.type !== "session.deleted" || !workspaceTmp) return
+          const sessionID = input.event.properties.info.id
+          if (!/^ses_[A-Za-z0-9]+$/.test(sessionID)) return
+          await rm(`''${workspaceTmp}/''${sessionID}`, { recursive: true, force: true })
+        },
+        "shell.env": async (input, output) => {
+          if (!workspaceAllowed) throw new Error("Shells require a managed workspace")
+          output.env.OPENCODE_SESSION_ID = input.sessionID
+        },
+        "tool.execute.before": async (input, output) => {
           if (!workspaceAllowed) {
             throw new Error("Tools are restricted to ${settings.workspacesRoot}")
+          }
+          const key = tmpPathKeys[input.tool]
+          if (key && isTmpPath(output.args?.[key])) {
+            throw new Error("Direct file tools cannot access shell temporary files; use bash")
           }
         },
         tool: {

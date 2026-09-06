@@ -16,6 +16,7 @@
 
   opencodePort = 4096;
   workspacesRoot = "/srv/opencode/workspaces";
+  workspacesTmpRoot = "/srv/opencode/workspace-tmp";
 
   githubBridge = {
     enable = true;

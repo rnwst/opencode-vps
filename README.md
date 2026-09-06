@@ -56,13 +56,16 @@ rejects all tool calls outside `/srv/opencode/workspaces`, including workspace
 symlink escapes.
 
 The command sandbox denies bot-home reads except Git configuration. It denies
-writes outside the current Git worktree and private `/tmp`, where common
-language and package-manager caches are redirected. It blocks local binding,
-Unix sockets, and TCP port 22, and allows only common source and package
-registry domains. The real GitHub token and a precomputed HTTP Basic credential
-are replaced by independent sentinels inside the sandbox. Git receives the
-masked credential through environment-based configuration, and Sandbox
-Runtime's TLS proxy restores it only in HTTPS requests to `github.com`.
+writes outside the current Git worktree and a session-private `/tmp`, where
+common language and package-manager caches are redirected. Temporary data is
+backed by `/srv/opencode/workspace-tmp/<WORKSPACE>/<SESSION_ID>` (with `.tasks`
+for automated workspaces), hidden from other sessions, and deleted with the
+session or workspace. It blocks local binding, Unix sockets, and TCP port 22,
+and allows only common source and package registry domains. The real GitHub
+token and a precomputed HTTP Basic credential are replaced by independent
+sentinels inside the sandbox. Git receives the masked credential through
+environment-based configuration, and Sandbox Runtime's TLS proxy restores it
+only in HTTPS requests to `github.com`.
 GitHub API clients use the separately masked token, restored for `github.com`
 and `api.github.com`.
 

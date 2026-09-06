@@ -9,7 +9,8 @@ machine configuration as infrastructure code and keep project work below
 - Work only in the current repository. OpenCode denies built-in tools access
   outside the repository except read-only Nix store paths.
 - Every shell tool call starts a new Sandbox Runtime (`srt`) and bubblewrap
-  sandbox. It can write only to the current Git worktree and `/tmp`.
+  sandbox. It can write only to the current Git worktree and the current
+  OpenCode session's private `/tmp`.
 - Shell network access is fail-closed and limited to common GitHub, language
   package registry, Nix, and container registry domains. Local port binding,
   SSH, and Unix sockets are blocked.

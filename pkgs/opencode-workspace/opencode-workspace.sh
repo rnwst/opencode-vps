@@ -7,6 +7,7 @@ bot_group=agent-workspaces
 admin_user=rnwst-admin
 workspaces_root=${OPENCODE_WORKSPACES_ROOT:?}
 tasks_root="$workspaces_root/.tasks"
+workspaces_tmp_root=${OPENCODE_WORKSPACES_TMP_ROOT:?}
 canonical_root=${OPENCODE_CANONICAL_ROOT:?}
 token_file=${OPENCODE_GITHUB_TOKEN_FILE:?}
 minimum_free_percent=${OPENCODE_MINIMUM_FREE_PERCENT:-15}
@@ -30,6 +31,7 @@ usage:
   opencode-workspace list
   opencode-workspace refresh OWNER/REPOSITORY
   opencode-workspace remove WORKSPACE_NAME [--force]
+  opencode-workspace ensure-temp manual|task WORKSPACE_NAME
   opencode-workspace prepare-task TASK_ID OWNER/REPOSITORY ACTION SUBJECT_NUMBER REF
   opencode-workspace restore-task TASK_ID OWNER/REPOSITORY ACTION SUBJECT_NUMBER REF
   opencode-workspace head-task TASK_ID
@@ -300,6 +302,26 @@ task_path() {
   workspace_path="$tasks_root/$1"
 }
 
+workspace_tmp_path() {
+  case "$workspace_path" in
+    "$tasks_root"/*) workspace_tmp_path="$workspaces_tmp_root/.tasks/${workspace_path##*/}" ;;
+    "$workspaces_root"/*) workspace_tmp_path="$workspaces_tmp_root/${workspace_path##*/}" ;;
+    *) die "workspace has no managed temporary path: $workspace_path" ;;
+  esac
+}
+
+ensure_workspace_tmp() {
+  workspace_tmp_path
+  install -d -m 0711 -o root -g root "$workspaces_tmp_root" "$workspaces_tmp_root/.tasks"
+  install -d -m 0700 -o "$bot_user" -g "$bot_group" "$workspace_tmp_path"
+}
+
+remove_workspace_tmp() {
+  workspace_tmp_path
+  rm -rf -- "$workspace_tmp_path"
+  [[ ! -e "$workspace_tmp_path" ]] || die "temporary workspace directory remains: $workspace_tmp_path"
+}
+
 command_create() {
   (( $# >= 1 && $# <= 2 )) || usage
   read_token
@@ -314,6 +336,7 @@ command_create() {
     btrfs subvolume delete "$workspace_path" >/dev/null || true
     exit 1
   fi
+  ensure_workspace_tmp
   printf '%s\n' "$workspace_path"
 }
 
@@ -328,6 +351,7 @@ command_init() {
   chmod 2750 "$workspace_path"
   git_as_bot_no_auth -C "$workspace_path" init --initial-branch=main
   apply_workspace_acl "$workspace_path"
+  ensure_workspace_tmp
   printf '%s\n' "$workspace_path"
 }
 
@@ -427,6 +451,7 @@ command_remove() {
     fi
   fi
   btrfs subvolume delete "$workspace_path" >/dev/null
+  remove_workspace_tmp
   printf 'Removed workspace: %s\n' "$workspace_path"
 }
 
@@ -444,6 +469,7 @@ command_prepare_task() {
       [[ "$(jq -er .task_id "$marker")" == "$task_id" ]] &&
       [[ "$(jq -er .repository_id "$marker")" == "$repo_id" ]] &&
       [[ "$(jq -er .action "$marker")" == "$action" ]]; then
+      ensure_workspace_tmp
       jq -n --arg path "$workspace_path" --arg repository "$repo_full_name" --arg id "$repo_id" \
         '{path: $path, repository: $repository, repository_id: $id}'
       return
@@ -468,6 +494,7 @@ command_prepare_task() {
     > "$marker"
   chown root:root "$marker"
   chmod 0444 "$marker"
+  ensure_workspace_tmp
   jq -n --arg path "$workspace_path" --arg repository "$repo_full_name" --arg id "$repo_id" \
     '{path: $path, repository: $repository, repository_id: $id}'
 }
@@ -488,6 +515,7 @@ command_restore_task() {
       [[ "$(jq -er .repository_id "$marker")" == "$repo_id" ]] &&
       [[ "$(jq -er .action "$marker")" == "$action" ]] ||
       die "existing task workspace does not match its task record"
+    ensure_workspace_tmp
     printf '%s\n' "$workspace_path"
     return
   fi
@@ -508,6 +536,7 @@ command_restore_task() {
     > "$marker"
   chown root:root "$marker"
   chmod 0444 "$marker"
+  ensure_workspace_tmp
   printf '%s\n' "$workspace_path"
 }
 
@@ -538,8 +567,22 @@ command_head_task() {
 command_remove_task() {
   (( $# == 1 )) || usage
   task_path "$1"
-  [[ -e "$workspace_path" ]] || exit 0
-  btrfs subvolume delete "$workspace_path" >/dev/null
+  if [[ -e "$workspace_path" ]]; then
+    btrfs subvolume delete "$workspace_path" >/dev/null
+  fi
+  remove_workspace_tmp
+  [[ ! -e "$workspace_path" ]] || die "task workspace remains: $workspace_path"
+}
+
+command_ensure_temp() {
+  (( $# == 2 )) || usage
+  case "$1" in
+    manual) manual_path "$2" ;;
+    task) task_path "$2" ;;
+    *) usage ;;
+  esac
+  [[ -d "$workspace_path/.git" ]] || die "workspace is not a Git repository: $workspace_path"
+  ensure_workspace_tmp
 }
 
 command=${1-}
@@ -559,6 +602,7 @@ case "$command" in
   list) command_list "$@" ;;
   refresh) command_refresh "$@" ;;
   remove) command_remove "$@" ;;
+  ensure-temp) command_ensure_temp "$@" ;;
   prepare-task) command_prepare_task "$@" ;;
   restore-task) command_restore_task "$@" ;;
   head-task) command_head_task "$@" ;;

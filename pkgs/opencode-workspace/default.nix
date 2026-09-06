@@ -21,6 +21,7 @@ pkgs.writeShellApplication {
   ];
   text = ''
     export OPENCODE_WORKSPACES_ROOT=${settings.workspacesRoot}
+    export OPENCODE_WORKSPACES_TMP_ROOT=${settings.workspacesTmpRoot}
     export OPENCODE_CANONICAL_ROOT=${settings.githubBridge.canonicalRoot}
     export OPENCODE_GITHUB_TOKEN_FILE=${settings.secrets.githubToken}
     export OPENCODE_MINIMUM_FREE_PERCENT=${toString settings.githubBridge.minimumFreePercent}

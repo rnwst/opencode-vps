@@ -43,6 +43,9 @@ let
           "*" = "deny";
           "/etc/opencode/AGENTS.md" = "allow";
           "/nix/store/**" = "allow";
+          "/tmp" = "allow";
+          "/tmp/*" = "allow";
+          "/tmp/**" = "allow";
         };
       };
       plugin = [ "file:///etc/opencode/plugins/managed-host.js" ];
@@ -79,7 +82,11 @@ in
   systemd.services = {
     opencode = {
       description = "OpenCode autonomous development server";
-      after = [ "network-online.target" ];
+      after = [
+        "network-online.target"
+        "opencode-workspace-temp-init.service"
+      ];
+      requires = [ "opencode-workspace-temp-init.service" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
       restartTriggers = [
@@ -123,6 +130,7 @@ in
           "/home/rnwst-bot"
           "/var/lib/ci-runner/jobs"
           settings.workspacesRoot
+          settings.workspacesTmpRoot
         ]
         ++ lib.optionals settings.githubBridge.enable [
           "${settings.githubBridge.stateRoot}/inbox"

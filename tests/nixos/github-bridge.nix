@@ -4,9 +4,33 @@
 }:
 let
   fakeGitHub = pkgs.writeText "fake-github.py" (builtins.readFile ./fake-github.py);
+  sessionTempPlugin = pkgs.writeText "session-temp-plugin.js" ''
+    import { rm } from "node:fs/promises"
+
+    export const SessionTemp = async ({ directory }) => {
+      const root = "${testSettings.workspacesRoot}"
+      const relative = directory.slice(root.length + 1)
+      const workspaceTmp = relative.startsWith(".tasks/")
+        ? "${testSettings.workspacesTmpRoot}/.tasks/" + relative.slice(".tasks/".length)
+        : "${testSettings.workspacesTmpRoot}/" + relative
+
+      return {
+        event: async (input) => {
+          if (input.event.type !== "session.deleted") return
+          const sessionID = input.event.properties.info.id
+          if (!/^ses_[A-Za-z0-9]+$/.test(sessionID)) return
+          await rm(`''${workspaceTmp}/''${sessionID}`, { recursive: true, force: true })
+        },
+        "shell.env": async (input, output) => {
+          output.env.OPENCODE_SESSION_ID = input.sessionID
+        },
+      }
+    }
+  '';
   testSettings = {
     opencodePort = 4096;
     workspacesRoot = "/srv/opencode/workspaces";
+    workspacesTmpRoot = "/srv/opencode/workspace-tmp";
     githubBridge = {
       enable = true;
       dryRun = false;
@@ -91,8 +115,20 @@ pkgs.testers.nixosTest {
             HOME = "/var/lib/rnwst-bot";
             OPENCODE_CONFIG_CONTENT = builtins.toJSON {
               autoupdate = false;
+              permission = {
+                "*" = "allow";
+                external_directory = {
+                  "*" = "deny";
+                  "/tmp" = "allow";
+                  "/tmp/*" = "allow";
+                  "/tmp/**" = "allow";
+                };
+              };
+              plugin = [ "file://${sessionTempPlugin}" ];
               share = "disabled";
+              shell = "${testLocalPackages.sandbox-exec}/bin/opencode-sandbox-exec";
             };
+            OPENCODE_DISABLE_DEFAULT_PLUGINS = "true";
             OPENCODE_DISABLE_PROJECT_CONFIG = "1";
             OPENCODE_SERVER_PASSWORD = "test-password";
             XDG_CACHE_HOME = "/var/lib/rnwst-bot/.cache";
@@ -102,9 +138,17 @@ pkgs.testers.nixosTest {
           serviceConfig = {
             User = "rnwst-bot";
             Group = "agent-workspaces";
-            ExecStart = "${testLocalPackages.opencode}/bin/opencode serve --pure --hostname 127.0.0.1 --port 4096";
+            ExecStart = "${testLocalPackages.opencode}/bin/opencode serve --hostname 127.0.0.1 --port 4096";
             Restart = "on-failure";
           };
+          preStart = ''
+            install -d -m 0750 /var/lib/rnwst-bot/.config/opencode/node_modules
+            printf '%s\n' '${
+              builtins.toJSON {
+                packages."".dependencies."@opencode-ai/plugin" = testLocalPackages.opencode.version;
+              }
+            }' > /var/lib/rnwst-bot/.config/opencode/package-lock.json
+          '';
         };
 
         fake-github = {
@@ -192,9 +236,23 @@ pkgs.testers.nixosTest {
       "= https://github.com/bot/repo.git"
     )
     machine.succeed("opencode-workspace remove-task task-bbbbbbbbbbbbbbbb")
+    machine.fail("test -e /srv/opencode/workspace-tmp/.tasks/task-bbbbbbbbbbbbbbbb")
     machine.succeed("rm /tmp/repo-push-denied")
 
     machine.succeed("opencode-workspace init alpha")
+    machine.succeed(
+      "runuser -u rnwst-bot -- env OPENCODE_SESSION_ID=ses_one bash -c "
+      "'cd /srv/opencode/workspaces/alpha && opencode-sandbox-exec -c "
+      "\"touch /tmp/one; test ! -r /srv/opencode/workspace-tmp/alpha/ses_two\"'"
+    )
+    machine.succeed(
+      "runuser -u rnwst-bot -- env OPENCODE_SESSION_ID=ses_two bash -c "
+      "'cd /srv/opencode/workspaces/alpha && opencode-sandbox-exec -c "
+      "\"test ! -e /tmp/one; touch /tmp/two; "
+      "test ! -r /srv/opencode/workspace-tmp/alpha/ses_one/one\"'"
+    )
+    machine.succeed("test -f /srv/opencode/workspace-tmp/alpha/ses_one/one")
+    machine.succeed("test -f /srv/opencode/workspace-tmp/alpha/ses_two/two")
     machine.succeed("btrfs subvolume show /srv/opencode/workspaces/alpha")
     machine.succeed("touch /srv/opencode/workspaces/alpha/original")
     machine.succeed(
@@ -233,8 +291,10 @@ pkgs.testers.nixosTest {
     )
     machine.succeed("opencode-workspace remove removable-project")
     machine.fail("test -e /srv/opencode/workspaces/removable-project")
+    machine.fail("test -e /srv/opencode/workspace-tmp/removable-project")
 
     machine.succeed("opencode-workspace remove cloned-one > /tmp/remove-output 2>&1")
+    machine.fail("test -e /srv/opencode/workspace-tmp/cloned-one")
     machine.succeed("grep -q 'fetching remote refs into a temporary repository' /tmp/remove-output")
     machine.succeed("grep -q 'Removed workspace: /srv/opencode/workspaces/cloned-one' /tmp/remove-output")
     machine.fail("grep -Eq 'Cloning into|^From |^remote:|^error:' /tmp/remove-output")
@@ -253,6 +313,7 @@ pkgs.testers.nixosTest {
     machine.succeed("touch /srv/opencode/workspaces/dirty-force-project/untracked")
     machine.succeed("opencode-workspace remove dirty-force-project --force")
     machine.fail("test -e /srv/opencode/workspaces/dirty-force-project")
+    machine.fail("test -e /srv/opencode/workspace-tmp/dirty-force-project")
 
     machine.succeed("opencode-workspace init public-project")
     machine.succeed("runuser -u rnwst-bot -- git -C /srv/opencode/workspaces/public-project -c user.name=Test -c user.email=test@example.com commit --allow-empty -m initial")
@@ -285,6 +346,19 @@ pkgs.testers.nixosTest {
       "| jq -e 'map(.parts[]? | select(.type == \"text\") | .text) "
       "| index(\"deterministic bridge prompt\")'"
     )
+    manual_shell = machine.succeed(
+      "curl --fail --silent --user opencode:test-password "
+      "--header 'Content-Type: application/json' "
+      "--data '{\"agent\":\"build\",\"model\":{\"providerID\":\"opencode\","
+      "\"modelID\":\"big-pickle\"},\"command\":"
+      "\"touch /tmp/manual-session; printf %s \\\"$OPENCODE_SESSION_ID\\\"\"}' "
+      f"'http://127.0.0.1:4096/session/{session_id}/shell?directory={directory}'"
+    )
+    manual_response = json.loads(manual_shell)
+    assert manual_response["parts"][0]["state"]["output"] == session_id, manual_response
+    machine.succeed(
+      f"test -f /srv/opencode/workspace-tmp/alpha/{session_id}/manual-session"
+    )
     machine.succeed(
       "curl --fail --silent --user opencode:test-password --request POST "
       f"'http://127.0.0.1:4096/session/{session_id}/abort?directory={directory}'"
@@ -292,6 +366,9 @@ pkgs.testers.nixosTest {
     machine.succeed(
       "curl --fail --silent --user opencode:test-password --request DELETE "
       f"'http://127.0.0.1:4096/session/{session_id}?directory={directory}'"
+    )
+    machine.wait_until_succeeds(
+      f"test ! -e /srv/opencode/workspace-tmp/alpha/{session_id}"
     )
 
     machine.succeed("systemctl start github-bridge.service")
@@ -330,5 +407,27 @@ pkgs.testers.nixosTest {
       "| jq -e 'map(.parts[]? | select(.type == \"text\") | .text) "
       "| any(startswith(\"## GitHub Task\\n\\n- Action:\"))'"
     )
+    machine.wait_until_succeeds(
+      "session=$(cat /tmp/task-session-id); "
+      "curl --fail --silent --user opencode:test-password "
+      f"'http://127.0.0.1:4096/session/status?directory={task_directory}' "
+      "| jq -e --arg session \"$session\" '(.[$session].type // \"idle\") == \"idle\"'"
+    )
+    machine.succeed(
+      "session=$(cat /tmp/task-session-id); "
+      "curl --fail --silent --user opencode:test-password "
+      "--header 'Content-Type: application/json' "
+      "--data '{\"agent\":\"build\",\"model\":{\"providerID\":\"opencode\","
+      "\"modelID\":\"big-pickle\"},\"command\":\"touch /tmp/from-opencode\"}' "
+      f"\"http://127.0.0.1:4096/session/$session/shell?directory={task_directory}\""
+    )
+    machine.succeed(
+      f"session=$(cat /tmp/task-session-id); test -f "
+      f"/srv/opencode/workspace-tmp/.tasks/{task_id}/$session/from-opencode"
+    )
+    machine.succeed(f"touch /srv/opencode/workspace-tmp/.tasks/{task_id}/discard-me")
+    machine.succeed(f"opencode-workspace remove-task {task_id}")
+    machine.fail(f"test -e /srv/opencode/workspaces/.tasks/{task_id}")
+    machine.fail(f"test -e /srv/opencode/workspace-tmp/.tasks/{task_id}")
   '';
 }

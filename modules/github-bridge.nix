@@ -83,6 +83,7 @@ in
             stateRoot
             cfg.canonicalRoot
             settings.workspacesRoot
+            settings.workspacesTmpRoot
             "/run/opencode-workspace"
           ];
           RestrictAddressFamilies = [
