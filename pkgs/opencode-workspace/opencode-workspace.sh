@@ -32,6 +32,7 @@ usage:
   opencode-workspace refresh OWNER/REPOSITORY
   opencode-workspace remove WORKSPACE_NAME [--force]
   opencode-workspace ensure-temp manual|task WORKSPACE_NAME
+  opencode-workspace manage-github manual|task WORKSPACE_NAME ACTION REPOSITORY UPSTREAM REMOTE BRANCH
   opencode-workspace prepare-task TASK_ID OWNER/REPOSITORY ACTION SUBJECT_NUMBER REF
   opencode-workspace restore-task TASK_ID OWNER/REPOSITORY ACTION SUBJECT_NUMBER REF
   opencode-workspace head-task TASK_ID
@@ -52,7 +53,7 @@ valid_task_id() {
 }
 
 valid_repo() {
-  [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]
 }
 
 valid_action() {
@@ -269,7 +270,20 @@ ensure_push_remote() {
   local destination=$1
   [[ "$repo_push" == "true" ]] && return 0
 
-  local bot_login fork_full fork_json
+  ensure_fork_url
+  local push_url=$fork_clone_url
+  if [[ "$workspace_test_mode" == 1 ]]; then
+    # Test fetches use local fixtures while workspace metadata stays realistic.
+    push_url="https://github.com/$fork_full.git"
+  fi
+  git_as_bot -C "$destination" remote rename origin upstream
+  git_as_bot -C "$destination" remote add origin "$push_url"
+}
+
+ensure_fork_url() {
+  # Numeric parent identity prevents a same-name repository from being used as
+  # a writable fork of an unrelated source repository.
+  local bot_login fork_json fork_parent_id
   bot_login="$(github_api GET /user | jq -er .login)"
   fork_full="$bot_login/$repo_name"
   if ! fork_json="$(github_api GET "/repos/$fork_full" 2>/dev/null)"; then
@@ -282,14 +296,15 @@ ensure_push_remote() {
     done
   fi
   [[ -n "${fork_json:-}" ]] || die "fork did not become available: $fork_full"
-  local fork_parent_id
   fork_parent_id="$(jq -er '.parent.id | tostring' <<<"$fork_json")" ||
     die "$fork_full exists but is not a fork of $repo_full_name"
   [[ "$fork_parent_id" == "$repo_id" ]] ||
     die "$fork_full is not a fork of $repo_full_name"
-
-  git_as_bot -C "$destination" remote rename origin upstream
-  git_as_bot -C "$destination" remote add origin "https://github.com/$fork_full.git"
+  fork_clone_url="$(jq -er .clone_url <<<"$fork_json")"
+  if [[ "$workspace_test_mode" != 1 ]]; then
+    validate_clone_url "$fork_clone_url" "$fork_full" ||
+      die "GitHub returned an unexpected fork clone URL"
+  fi
 }
 
 manual_path() {
@@ -320,6 +335,144 @@ remove_workspace_tmp() {
   workspace_tmp_path
   rm -rf -- "$workspace_tmp_path"
   [[ ! -e "$workspace_tmp_path" ]] || die "temporary workspace directory remains: $workspace_tmp_path"
+}
+
+select_workspace() {
+  case "$1" in
+    manual) manual_path "$2" ;;
+    task) task_path "$2" ;;
+    *) die "invalid workspace kind: $1" ;;
+  esac
+  [[ -d "$workspace_path/.git" && ! -e "$workspace_path/.git/gitdir" ]] ||
+    die "workspace is not a supported Git repository: $workspace_path"
+}
+
+managed_remote() {
+  [[ "$1" == origin || "$1" == source || "$1" == upstream ]] ||
+    die "invalid managed remote: $1"
+}
+
+remove_remote() {
+  git_as_bot -C "$workspace_path" remote remove "$1" >/dev/null 2>&1 || true
+}
+
+set_remote_url() {
+  local remote=$1 url=$2
+  # Recreate the fixed remote instead of retaining extra fetch or push URLs
+  # that may have been configured before the workspace became managed.
+  remove_remote "$remote"
+  git_as_bot -C "$workspace_path" remote add "$remote" "$url"
+}
+
+fetch_managed_remote() {
+  local remote=$1 url owner_repo
+  managed_remote "$remote"
+  url="$(git_as_bot -C "$workspace_path" remote get-url "$remote")" ||
+    die "managed remote does not exist: $remote"
+  [[ "$url" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\.git$ ]] ||
+    die "managed remote is not a GitHub HTTPS repository: $remote"
+  owner_repo=${BASH_REMATCH[1]}
+  resolve_repo "$owner_repo"
+  [[ "$url" == "$clone_url" ]] ||
+    die "managed remote URL does not match GitHub metadata: $remote"
+  git_as_bot -C "$workspace_path" fetch --prune "$remote" \
+    "+refs/heads/*:refs/remotes/$remote/*"
+}
+
+command_manage_github() {
+  (( $# == 7 )) || usage
+  local kind=$1 name=$2 action=$3 repository=$4 upstream_repository=$5 remote=$6 branch=$7
+  select_workspace "$kind" "$name"
+
+  case "$action" in
+    setup)
+      valid_repo "$repository" || die "invalid GitHub repository: $repository"
+      read_token
+      resolve_repo "$repository"
+      local source_id=$repo_id source_full=$repo_full_name source_url=$clone_url source_push=$repo_push
+      local origin_url=$source_url source_remote_url='' upstream_url=''
+      if [[ "$source_push" != true ]]; then
+        ensure_fork_url
+        origin_url=$fork_clone_url
+        if [[ "$upstream_repository" == - ]]; then
+          upstream_url=$source_url
+        else
+          source_remote_url=$source_url
+        fi
+      fi
+      if [[ "$kind" == task ]]; then
+        local marker="$workspace_path/.git/opencode-task.json"
+        [[ -r "$marker" && "$(jq -er '.repository_id | tostring' "$marker")" == "$source_id" ]] ||
+          die "task workspace repository does not match the requested repository"
+      fi
+      if [[ "$upstream_repository" != - ]]; then
+        resolve_repo "$upstream_repository"
+        upstream_url=$clone_url
+      fi
+
+      remove_remote source
+      remove_remote upstream
+      set_remote_url origin "$origin_url"
+      [[ -z "$source_remote_url" ]] || set_remote_url source "$source_remote_url"
+      [[ -z "$upstream_url" ]] || set_remote_url upstream "$upstream_url"
+      fetch_managed_remote origin
+      [[ -z "$source_remote_url" ]] || fetch_managed_remote source
+      [[ -z "$upstream_url" ]] || fetch_managed_remote upstream
+      jq -n --arg action setup --arg repository "$source_full" --arg origin "$origin_url" \
+        --arg source "$source_remote_url" --arg upstream "$upstream_url" \
+        '{action: $action, repository: $repository, origin: $origin,
+          source: (if $source == "" then null else $source end),
+          upstream: (if $upstream == "" then null else $upstream end)}'
+      ;;
+    set)
+      [[ "$kind" == manual ]] ||
+        die "individual remote changes are limited to manual workspaces"
+      managed_remote "$remote"
+      valid_repo "$repository" || die "invalid GitHub repository: $repository"
+      read_token
+      resolve_repo "$repository"
+      set_remote_url "$remote" "$clone_url"
+      fetch_managed_remote "$remote"
+      jq -n --arg action set --arg remote "$remote" --arg repository "$repo_full_name" \
+        --arg url "$clone_url" \
+        '{action: $action, remote: $remote, repository: $repository, url: $url}'
+      ;;
+    fetch)
+      read_token
+      if [[ "$remote" == all ]]; then
+        local fetched=()
+        for candidate in origin source upstream; do
+          if git_as_bot -C "$workspace_path" remote get-url "$candidate" >/dev/null 2>&1; then
+            fetch_managed_remote "$candidate"
+            fetched+=("$candidate")
+          fi
+        done
+        ((${#fetched[@]} > 0)) || die "workspace has no managed remotes"
+        printf '%s\n' "${fetched[@]}" | jq -Rsc \
+          '{action: "fetch", remotes: (split("\n") | map(select(length > 0)))}'
+      else
+        fetch_managed_remote "$remote"
+        jq -n --arg action fetch --arg remote "$remote" \
+          '{action: $action, remotes: [$remote]}'
+      fi
+      ;;
+    track)
+      managed_remote "$remote"
+      [[ "$branch" != - ]] || branch="$(git_as_bot -C "$workspace_path" branch --show-current)"
+      [[ -n "$branch" ]] || die "cannot track a detached HEAD"
+      git_as_bot -C "$workspace_path" check-ref-format --branch "$branch" >/dev/null
+      git_as_bot -C "$workspace_path" show-ref --verify --quiet "refs/heads/$branch" ||
+        die "local branch does not exist: $branch"
+      read_token
+      fetch_managed_remote "$remote"
+      # This interface can persist only the two branch-tracking keys.
+      git_as_bot -C "$workspace_path" config "branch.$branch.remote" "$remote"
+      git_as_bot -C "$workspace_path" config "branch.$branch.merge" "refs/heads/$branch"
+      jq -n --arg action track --arg remote "$remote" --arg branch "$branch" \
+        '{action: $action, remote: $remote, branch: $branch}'
+      ;;
+    *) die "invalid GitHub remote action: $action" ;;
+  esac
 }
 
 command_create() {
@@ -590,7 +743,7 @@ command=${1-}
 shift
 if [[ "${SUDO_USER:-}" == "github-bridge" ]]; then
   case "$command" in
-    prepare-task|restore-task|head-task|inspect-task|remove-task) ;;
+    prepare-task|restore-task|head-task|inspect-task|remove-task|manage-github) ;;
     *) die "github-bridge may only use internal task commands" ;;
   esac
 fi
@@ -603,6 +756,7 @@ case "$command" in
   refresh) command_refresh "$@" ;;
   remove) command_remove "$@" ;;
   ensure-temp) command_ensure_temp "$@" ;;
+  manage-github) command_manage_github "$@" ;;
   prepare-task) command_prepare_task "$@" ;;
   restore-task) command_restore_task "$@" ;;
   head-task) command_head_task "$@" ;;

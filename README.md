@@ -60,12 +60,11 @@ writes outside the current Git worktree and a session-private `/tmp`, where
 common language and package-manager caches are redirected. Temporary data is
 backed by `/srv/opencode/workspace-tmp/<WORKSPACE>/<SESSION_ID>` (with `.tasks`
 for automated workspaces), hidden from other sessions, and deleted with the
-session or workspace. It blocks local binding, Unix sockets, and TCP port 22,
-and allows only common source and package registry domains. The real GitHub
-token and a precomputed HTTP Basic credential are replaced by independent
-sentinels inside the sandbox. Git receives the masked credential through
-environment-based configuration, and Sandbox Runtime's TLS proxy restores it
-only in HTTPS requests to `github.com`.
+session or workspace. It permits general outbound access while blocking local
+binding, Unix sockets, and TCP port 22. The real GitHub token and a precomputed
+HTTP Basic credential are replaced by independent sentinels inside the sandbox.
+Git receives the masked credential through environment-based configuration, and
+Sandbox Runtime's TLS proxy restores it only in HTTPS requests to `github.com`.
 GitHub API clients use the separately masked token, restored for `github.com`
 and `api.github.com`.
 
@@ -661,6 +660,10 @@ not stranded after state loss or an interrupted registration.
 After creating a PR, the agent calls `github_track_pr` with the returned URL.
 The tool obtains the current session and directory from OpenCode, verifies that
 the bot authored the PR, and makes that session active for future PR feedback.
+The `github_manage_remote` tool sends similarly authenticated requests for
+validated GitHub repository setup. It can create or discover the bot fork,
+manage only `origin`, `source`, and `upstream`, fetch branch refs, and persist
+tracking for a validated local branch; it cannot write arbitrary Git settings.
 
 Initial bridge prompts contain only the subject URL, title, body, prepared
 checkout, and verified controller instruction. PR reviews do not include a full
@@ -939,10 +942,10 @@ JuliaFormatter launchers are pinned in `pkgs/default.nix`; on first use they
 install the pinned Julia app into the current user's Julia depot using free
 nixpkgs Julia. Change those pins explicitly and test startup when upgrading.
 
-If a new package manager needs a network host from agent shell commands, add
-the narrow domain to the Sandbox Runtime allowlist in `pkgs/default.nix`.
-Avoid broadening filesystem access, enabling local binding or Unix sockets, or
-passing credentials directly into the sandbox.
+Agent shells have general outbound access for source and package retrieval.
+Keep credentials destination-scoped in Sandbox Runtime rather than passing
+their real values into the sandbox. Avoid broadening filesystem access or
+enabling local binding, SSH, or Unix sockets.
 
 Validate every tooling change:
 

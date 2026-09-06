@@ -7,6 +7,13 @@ let
   inherit (pkgs) julia;
   inherit (pkgsUnstable) opencode;
 
+  # SRT's generic policy creates temporary mount points for repository files
+  # such as .gitmodules. This host treats repository configuration as source,
+  # while retaining SRT's separate .git/config and .git/hooks protections.
+  sandbox-runtime = pkgsUnstable.sandbox-runtime.overrideAttrs (oldAttrs: {
+    patches = (oldAttrs.patches or [ ]) ++ [ ./sandbox-runtime-host-policy.patch ];
+  });
+
   fishCompletionGenerator =
     pkgs.runCommandLocal "fish-completion-generator"
       {
@@ -123,7 +130,7 @@ let
       coreutils
       git
       jq
-      pkgsUnstable.sandbox-runtime
+      sandbox-runtime
       ripgrep
       socat
     ];
@@ -187,16 +194,23 @@ let
 
       if [[ "$mode" == "shell" && -n "''${CREDENTIALS_DIRECTORY:-}" && -r "$CREDENTIALS_DIRECTORY/github-token" ]]; then
         GH_TOKEN="$(<"$CREDENTIALS_DIRECTORY/github-token")"
-        GIT_CONFIG_COUNT=3
+        # Select the writable fork for bare pushes without persisting branch
+        # metadata in the protected repository config.
+        GIT_CONFIG_COUNT=5
         GIT_CONFIG_KEY_0=http.https://github.com/.extraHeader
         GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 --wrap=0)"
         GIT_CONFIG_KEY_1=credential.helper
         GIT_CONFIG_VALUE_1=
         GIT_CONFIG_KEY_2=push.default
         GIT_CONFIG_VALUE_2=current
+        GIT_CONFIG_KEY_3=remote.pushDefault
+        GIT_CONFIG_VALUE_3=origin
+        GIT_CONFIG_KEY_4=push.autoSetupRemote
+        GIT_CONFIG_VALUE_4=false
         export GH_TOKEN
         export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
         export GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1 GIT_CONFIG_KEY_2 GIT_CONFIG_VALUE_2
+        export GIT_CONFIG_KEY_3 GIT_CONFIG_VALUE_3 GIT_CONFIG_KEY_4 GIT_CONFIG_VALUE_4
         export GIT_TERMINAL_PROMPT=0
       fi
 
@@ -294,7 +308,9 @@ let
             deniedDomainReasons: {
               "*:22": "SSH is blocked in agent commands; use GitHub over HTTPS with the masked GH_TOKEN."
             },
-            strictAllowlist: true,
+            # Explicit denies still apply, while unmatched public dependency
+            # hosts are reachable without an interactive approval callback.
+            strictAllowlist: false,
             allowLocalBinding: false,
             tlsTerminate: {}
           },
@@ -329,7 +345,7 @@ let
         --bind "$root" "$root" \
         --bind "$session_tmp" /tmp \
         --chdir "$cwd" \
-        -- ${pkgsUnstable.sandbox-runtime}/bin/srt --settings "$settings_inside" -- "$@"
+        -- ${sandbox-runtime}/bin/srt --settings "$settings_inside" -- "$@"
     '';
   };
 
@@ -474,6 +490,54 @@ let
       const isTmpPath = (value) =>
         typeof value === "string" && (value === "/tmp" || value.startsWith("/tmp/"))
 
+      // Privileged workspace changes cross a file-based request channel so the
+      // OpenCode process never receives sudo access or an unmasked GitHub token.
+      const managedRequest = async (operation, args, context) => {
+        const timeout = 300000
+        const requestID = randomUUID().replaceAll("-", "")
+        const root = "${settings.githubBridge.stateRoot}"
+        const temporary = `${"$"}{root}/inbox/.request-${"$"}{requestID}.tmp`
+        const request = `${"$"}{root}/inbox/request-${"$"}{requestID}.json`
+        const response = `${"$"}{root}/responses/response-${"$"}{requestID}.json`
+        const payload = JSON.stringify({
+          version: 1,
+          operation,
+          request_id: requestID,
+          session_id: context.sessionID,
+          directory: context.directory,
+          expires_at: Date.now() + timeout,
+          arguments: args,
+        })
+        let aborted = context.abort.aborted
+        const abort = () => { aborted = true }
+        context.abort.addEventListener("abort", abort, { once: true })
+        await writeFile(temporary, payload, { flag: "wx", mode: 0o640 })
+        await rename(temporary, request)
+
+        try {
+          for (let attempt = 0; attempt < timeout / 200; attempt++) {
+            if (aborted) throw new Error("Managed GitHub operation cancelled")
+            try {
+              const result = JSON.parse(await readFile(response, "utf8"))
+              await unlink(response)
+              if (result.request_id !== requestID) {
+                throw new Error("Managed GitHub response ID did not match the request")
+              }
+              if (!result.ok) throw new Error(result.error || "Managed GitHub operation failed")
+              return result.result ?? result
+            } catch (error) {
+              if (error?.code !== "ENOENT") throw error
+            }
+            await Bun.sleep(200)
+          }
+          throw new Error("Timed out waiting for managed GitHub operation")
+        } finally {
+          context.abort.removeEventListener("abort", abort)
+          await unlink(temporary).catch(() => {})
+          await unlink(request).catch(() => {})
+        }
+      }
+
       return {
         event: async (input) => {
           if (input.event.type !== "session.deleted" || !workspaceTmp) return
@@ -502,44 +566,28 @@ let
                 pr_url: tool.schema.string().url().describe("GitHub pull request URL returned by gh pr create"),
               },
               async execute(args, context) {
-                const requestID = randomUUID().replaceAll("-", "")
-                const root = "${settings.githubBridge.stateRoot}"
-                const temporary = `${"$"}{root}/inbox/.request-${"$"}{requestID}.tmp`
-                const request = `${"$"}{root}/inbox/request-${"$"}{requestID}.json`
-                const response = `${"$"}{root}/responses/response-${"$"}{requestID}.json`
-                const payload = JSON.stringify({
-                  request_id: requestID,
-                  pr_url: args.pr_url,
-                  session_id: context.sessionID,
-                  directory: context.directory,
-                  agent: context.agent,
-                  expires_at: Date.now() + 120000,
-                })
-                let aborted = context.abort.aborted
-                const abort = () => { aborted = true }
-                context.abort.addEventListener("abort", abort, { once: true })
-                await writeFile(temporary, payload, { flag: "wx", mode: 0o640 })
-                await rename(temporary, request)
-
-                try {
-                  for (let attempt = 0; attempt < 600; attempt++) {
-                    if (aborted) throw new Error("PR registration cancelled")
-                    try {
-                      const result = JSON.parse(await readFile(response, "utf8"))
-                      await unlink(response)
-                      if (!result.ok) throw new Error(result.error || "PR registration failed")
-                      return `Registered ${"$"}{args.pr_url} with session ${"$"}{context.sessionID}`
-                    } catch (error) {
-                      if (error?.code !== "ENOENT") throw error
-                    }
-                    await Bun.sleep(200)
-                  }
-                  throw new Error("Timed out waiting for PR registration")
-                } finally {
-                  context.abort.removeEventListener("abort", abort)
-                  await unlink(temporary).catch(() => {})
-                  await unlink(request).catch(() => {})
+                await managedRequest("track_pr", { pr_url: args.pr_url }, context)
+                return `Registered ${"$"}{args.pr_url} with session ${"$"}{context.sessionID}`
+              },
+            }),
+            github_manage_remote: tool({
+              description: "Safely configure, fetch, or track validated GitHub remotes without exposing arbitrary .git/config writes. Use setup to discover or create a writable bot fork and configure origin/source/upstream.",
+              args: {
+                action: tool.schema.enum(["setup", "set", "fetch", "track"]),
+                repository: tool.schema.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/).optional(),
+                upstream_repository: tool.schema.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/).optional(),
+                remote: tool.schema.enum(["origin", "source", "upstream", "all"]).optional(),
+                branch: tool.schema.string().max(255).optional(),
+              },
+              async execute(args, context) {
+                if (["setup", "set"].includes(args.action) && !args.repository) {
+                  throw new Error(`repository is required for ${"$"}{args.action}`)
                 }
+                if (args.upstream_repository && args.action !== "setup") {
+                  throw new Error("upstream_repository is valid only for setup")
+                }
+                const result = await managedRequest("manage_github_remote", args, context)
+                return JSON.stringify(result, null, 2)
               },
             }),
           ''}

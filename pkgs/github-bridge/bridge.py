@@ -144,6 +144,16 @@ def parse_github_pr_url(url: str) -> tuple[str, str, int]:
     return match.group(1), match.group(2), int(match.group(3))
 
 
+def parse_github_repository(value: str) -> str:
+    """Validate repository coordinates before they cross the sudo boundary."""
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}",
+        value,
+    ):
+        raise BridgeError("invalid GitHub repository")
+    return value
+
+
 def parse_mention(body: str, bot_login: str) -> tuple[str, str] | None:
     pattern = re.compile(
         rf"(?i)(?<![A-Za-z0-9-])@{re.escape(bot_login)}\s+"
@@ -1190,6 +1200,28 @@ class WorkspaceManager:
 
     def remove(self, task_id: str) -> None:
         self.run("remove-task", task_id)
+
+    def manage_github(
+        self,
+        kind: str,
+        name: str,
+        action: str,
+        repository: str = "-",
+        upstream: str = "-",
+        remote: str = "all",
+        branch: str = "-",
+    ) -> dict[str, Any]:
+        output = self.run(
+            "manage-github",
+            kind,
+            name,
+            action,
+            repository,
+            upstream,
+            remote,
+            branch,
+        )
+        return json.loads(output)
 
 
 class Bridge:
@@ -2529,9 +2561,24 @@ class Bridge:
                     data = json.loads(os.read(descriptor, 65537))
                 finally:
                     os.close(descriptor)
-                response = self.register_pr(data)
+                if not isinstance(data, dict):
+                    raise BridgeError("managed request must be a JSON object")
+                if data.get("request_id") != request_id:
+                    raise BridgeError("managed request ID does not match its filename")
+                operation = data.get("operation")
+                if operation is None and "pr_url" in data:
+                    # Accept requests created by the previously deployed plugin.
+                    response = self.register_pr(data)
+                elif data.get("version") != 1:
+                    raise BridgeError("unsupported managed request version")
+                elif operation == "track_pr":
+                    response = self.register_pr(data)
+                elif operation == "manage_github_remote":
+                    response = self.manage_github_remote(data)
+                else:
+                    raise BridgeError("unsupported managed request operation")
             except Exception as error:  # noqa: BLE001
-                response = {"ok": False, "error": str(error)}
+                response = {"ok": False, "request_id": request_id, "error": str(error)}
             temporary = responses / f".{request_id}.{secrets.token_hex(4)}.tmp"
             destination = responses / f"response-{request_id}.json"
             temporary.write_text(json.dumps(response))
@@ -2551,7 +2598,11 @@ class Bridge:
         workspace_root = str(self.config.workspaces_root.resolve()) + os.sep
         if not directory.startswith(workspace_root):
             raise BridgeError("registration directory is outside the workspace root")
-        owner, repo, number = parse_github_pr_url(str(data.get("pr_url") or ""))
+        arguments = data.get("arguments")
+        pr_url = data.get("pr_url")
+        if pr_url is None and isinstance(arguments, dict):
+            pr_url = arguments.get("pr_url")
+        owner, repo, number = parse_github_pr_url(str(pr_url or ""))
         pull = self.github.pull(owner, repo, number)
         if numeric_id(pull.get("user", {}).get("id"), "PR author ID") != self.bot_id:
             raise BridgeError("pull request was not authored by the bot account")
@@ -2593,6 +2644,109 @@ class Bridge:
             "request_id": request_id,
             "subject_node_id": subject["node_id"],
         }
+
+    def manage_github_remote(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Authorize one constrained Git operation for the requesting session."""
+        if self.config.dry_run:
+            raise BridgeError("GitHub remote management is disabled in dry-run mode")
+        expected_keys = {
+            "version",
+            "operation",
+            "request_id",
+            "session_id",
+            "directory",
+            "expires_at",
+            "arguments",
+        }
+        if set(data) != expected_keys:
+            raise BridgeError("managed request has unexpected fields")
+        request_id = str(data.get("request_id") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", request_id):
+            raise BridgeError("invalid managed request ID")
+        now = int(time.time() * 1000)
+        expires_at = data.get("expires_at")
+        if (
+            not isinstance(expires_at, int)
+            or isinstance(expires_at, bool)
+            or expires_at < now
+            or expires_at > now + 300000
+        ):
+            raise BridgeError("managed request has an invalid expiry")
+
+        session_id = str(data.get("session_id") or "")
+        if not re.fullmatch(r"ses_[A-Za-z0-9]+", session_id):
+            raise BridgeError("invalid OpenCode session ID")
+        raw_directory = str(data.get("directory") or "")
+        directory = Path(raw_directory).resolve()
+        root = self.config.workspaces_root.resolve()
+        try:
+            relative = directory.relative_to(root)
+        except ValueError as error:
+            raise BridgeError(
+                "managed request directory is outside the workspace root"
+            ) from error
+        parts = relative.parts
+        if len(parts) == 1 and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", parts[0]
+        ):
+            kind, name = "manual", parts[0]
+        elif (
+            len(parts) == 2
+            and parts[0] == ".tasks"
+            and re.fullmatch(r"task-[a-z0-9][a-z0-9-]{7,95}", parts[1])
+        ):
+            kind, name = "task", parts[1]
+        else:
+            raise BridgeError("managed request directory is not a workspace root")
+        session = self.opencode.get_session(session_id, str(directory))
+        if str(Path(str(session.get("directory") or "")).resolve()) != str(directory):
+            raise BridgeError(
+                "OpenCode session directory does not match managed request"
+            )
+
+        arguments = data.get("arguments")
+        if not isinstance(arguments, dict):
+            raise BridgeError("managed request arguments must be an object")
+        action = str(arguments.get("action") or "")
+        if action not in {"setup", "set", "fetch", "track"}:
+            raise BridgeError("invalid GitHub remote action")
+        action_keys = {
+            "setup": {"action", "repository", "upstream_repository"},
+            "set": {"action", "repository", "remote"},
+            "fetch": {"action", "remote"},
+            "track": {"action", "remote", "branch"},
+        }[action]
+        if not set(arguments).issubset(action_keys):
+            raise BridgeError("GitHub remote action has unexpected arguments")
+        repository = str(arguments.get("repository") or "-")
+        upstream = str(arguments.get("upstream_repository") or "-")
+        remote = str(
+            arguments.get("remote") or ("all" if action == "fetch" else "origin")
+        )
+        branch = str(arguments.get("branch") or "-")
+        if repository != "-":
+            repository = parse_github_repository(repository)
+        if upstream != "-":
+            upstream = parse_github_repository(upstream)
+        if remote not in {"origin", "source", "upstream", "all"}:
+            raise BridgeError("invalid managed remote")
+        if len(branch) > 255 or any(character in branch for character in "\n\r\0"):
+            raise BridgeError("invalid branch name")
+        if action in {"setup", "set"} and repository == "-":
+            raise BridgeError("repository is required for this action")
+        if action != "setup" and upstream != "-":
+            raise BridgeError("upstream_repository is valid only for setup")
+        if action == "set" and remote == "all":
+            raise BridgeError("set requires one managed remote")
+        if action == "track" and remote == "all":
+            raise BridgeError("track requires one managed remote")
+        if action == "setup" and remote != "origin":
+            raise BridgeError("setup does not accept a remote override")
+
+        result = self.workspaces.manage_github(
+            kind, name, action, repository, upstream, remote, branch
+        )
+        return {"ok": True, "request_id": request_id, "result": result}
 
     def update_completed_tasks(self) -> None:
         for task in self.db.status_rows():

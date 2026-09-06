@@ -11,8 +11,7 @@ machine configuration as infrastructure code and keep project work below
 - Every shell tool call starts a new Sandbox Runtime (`srt`) and bubblewrap
   sandbox. It can write only to the current Git worktree and the current
   OpenCode session's private `/tmp`.
-- Shell network access is fail-closed and limited to common GitHub, language
-  package registry, Nix, and container registry domains. Local port binding,
+- Shell commands have general outbound network access, but local port binding,
   SSH, and Unix sockets are blocked.
 - OpenCode sharing, snapshots, and automatic self-updates are disabled by
   root-managed configuration. Git is the source of truth for changes.
@@ -23,6 +22,14 @@ machine configuration as infrastructure code and keep project work below
 - All GitHub Git transport uses HTTPS. The operator provisions and maintains
   workspaces with `sudo opencode-git`; normal agent `git` commands authenticate
   through the masked HTTP header without exposing the token.
+- `.git/config` and `.git/hooks` are host-protected control data. Use
+  `github_manage_remote` to set up a fork, manage `origin`, `source`, or
+  `upstream`, fetch branches, or persist tracking for a local branch. Do not use
+  `git config --local`, `git remote`, `git push -u`, or
+  `push.autoSetupRemote`.
+- Bare `git push` sends the current branch to the same branch name on `origin`.
+  If no managed remote is appropriate, use an explicit GitHub HTTPS URL and
+  verify the result with `git ls-remote`; never persist credentials in a URL.
 - Project `opencode.json` files and `.opencode` plugins are disabled. Make
   host-wide OpenCode changes in the Nix-managed configuration, not in a
   repository.

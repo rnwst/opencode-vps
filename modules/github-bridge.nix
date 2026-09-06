@@ -106,7 +106,7 @@ in
       };
 
       paths.github-bridge-inbox = {
-        description = "Process OpenCode PR registrations";
+        description = "Process managed OpenCode GitHub requests";
         wantedBy = [ "multi-user.target" ];
         pathConfig = {
           PathChanged = "${stateRoot}/inbox";

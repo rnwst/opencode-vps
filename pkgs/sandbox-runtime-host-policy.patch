@@ -1,0 +1,72 @@
+diff --git a/src/sandbox/sandbox-manager.ts b/src/sandbox/sandbox-manager.ts
+index 60a243a..005bf7f 100644
+--- a/src/sandbox/sandbox-manager.ts
++++ b/src/sandbox/sandbox-manager.ts
+@@ -353,13 +353,21 @@ async function checkDomainAllowed(
+     }
+   }
+ 
+-  // No matching rules - ask user or deny. strictAllowlist makes the
+-  // allowlist deterministic enforcement: never fall through to the callback.
+-  if (!sandboxAskCallback || config.network.strictAllowlist) {
++  // A strict allowlist is deterministic enforcement and never falls through
++  // to an interactive callback.
++  if (config.network.strictAllowlist) {
+     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
+     return denied('host is not on the allow list')
+   }
+ 
++  // Headless callers have no way to approve an unmatched destination. Treat
++  // a non-strict policy without a callback as general outbound access; deny
++  // rules above remain authoritative.
++  if (!sandboxAskCallback) {
++    logForDebugging(`No matching config rule, allowing: ${host}:${port}`)
++    return true
++  }
++
+   logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
+   try {
+     const userAllowed = await sandboxAskCallback({ host, port })
+diff --git a/src/sandbox/sandbox-utils.ts b/src/sandbox/sandbox-utils.ts
+index b259689..555366b 100644
+--- a/src/sandbox/sandbox-utils.ts
++++ b/src/sandbox/sandbox-utils.ts
+@@ -8,23 +8,13 @@ import { logForDebugging } from '../utils/debug.js'
+  * Dangerous files that should be protected from writes.
+  * These files can be used for code execution or data exfiltration.
+  */
+-export const DANGEROUS_FILES = [
+-  '.gitconfig',
+-  '.gitmodules',
+-  '.bashrc',
+-  '.bash_profile',
+-  '.zshrc',
+-  '.zprofile',
+-  '.profile',
+-  '.ripgreprc',
+-  '.mcp.json',
+-] as const
++export const DANGEROUS_FILES = [] as const
+ 
+ /**
+  * Dangerous directories that should be protected from writes.
+  * These directories contain sensitive configuration or executable files.
+  */
+-export const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
++export const DANGEROUS_DIRECTORIES = ['.git'] as const
+ 
+ /**
+  * Get the list of dangerous directories to deny writes to.
+@@ -34,11 +21,7 @@ export const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
+  * instead we block specific paths within .git (hooks and config).
+  */
+ export function getDangerousDirectories(): string[] {
+-  return [
+-    ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
+-    '.claude/commands',
+-    '.claude/agents',
+-  ]
++  return DANGEROUS_DIRECTORIES.filter(d => d !== '.git')
+ }
+ 
+ /**
