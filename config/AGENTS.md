@@ -11,8 +11,10 @@ machine configuration as infrastructure code and keep project work below
 - Every shell tool call starts a new Sandbox Runtime (`srt`) and bubblewrap
   sandbox. It can write only to the current Git worktree and the current
   OpenCode session's private `/tmp`.
-- Shell commands have general outbound network access, but local port binding,
-  SSH, and Unix sockets are blocked.
+- Shell commands have outbound access to public destinations through SRT's
+  proxy. Private/loopback destinations through that proxy, SSH, and Unix socket
+  creation are blocked. Local TCP listeners are confined to the current shell
+  invocation's private network namespace, not shared with other calls.
 - OpenCode sharing, snapshots, and automatic self-updates are disabled by
   root-managed configuration. Git is the source of truth for changes.
 - Never search for, print, or persist credentials. OpenCode provider auth,

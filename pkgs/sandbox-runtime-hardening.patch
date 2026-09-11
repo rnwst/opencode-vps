@@ -1,0 +1,153 @@
+diff --git a/src/sandbox/generate-seccomp-filter.ts b/src/sandbox/generate-seccomp-filter.ts
+--- a/src/sandbox/generate-seccomp-filter.ts
++++ b/src/sandbox/generate-seccomp-filter.ts
+@@ -151,11 +151,9 @@
+  * 1. vendor/seccomp/{arch}/apply-seccomp (bundled - when bundled into consuming packages)
+  * 2. ../../vendor/seccomp/{arch}/apply-seccomp (package root - standard npm installs)
+  * 3. ../vendor/seccomp/{arch}/apply-seccomp (dist/vendor - for bundlers)
+- * 4. Global npm install (if seccompBinaryPath not provided) - for native builds
+  *
+  * @param seccompBinaryPath - Optional explicit path to the apply-seccomp binary. If provided
+- *   and exists, it will be used. If not provided, falls back to searching local paths and
+- *   then global npm install (for native builds where vendor directory isn't bundled).
++ *   it must be executable; otherwise only bundled binaries are considered.
+  */
+ export function getApplySeccompBinaryPath(
+   seccompBinaryPath?: string,
+@@ -173,13 +171,14 @@
+ function findApplySeccompPath(seccompBinaryPath?: string): string | null {
+-  // Check explicit path first (highest priority)
++  // An explicit path is mandatory, not a hint to search another installation.
+   if (seccompBinaryPath) {
+-    if (fs.existsSync(seccompBinaryPath)) {
++    try {
++      fs.accessSync(seccompBinaryPath, fs.constants.X_OK)
++      if (!fs.statSync(seccompBinaryPath).isFile()) return null
+       logForDebugging(
+         `[SeccompFilter] Using apply-seccomp binary from explicit path: ${seccompBinaryPath}`,
+       )
+       return seccompBinaryPath
++    } catch {
++      return null
+     }
+-    logForDebugging(
+-      `[SeccompFilter] Explicit path provided but file not found: ${seccompBinaryPath}`,
+-    )
+   }
+@@ -198,29 +197,16 @@
+ 
+   // Check local paths first (bundled or package install)
+   for (const binaryPath of getLocalSeccompPaths('apply-seccomp')) {
+-    if (fs.existsSync(binaryPath)) {
++    try {
++      fs.accessSync(binaryPath, fs.constants.X_OK)
++      if (!fs.statSync(binaryPath).isFile()) continue
+       logForDebugging(
+         `[SeccompFilter] Found apply-seccomp binary: ${binaryPath} (${arch})`,
+       )
+       return binaryPath
++    } catch {
++      continue
+     }
+   }
+ 
+-  // Fallback: check global npm install (for native builds without bundled vendor)
+-  for (const globalBase of getGlobalNpmPaths()) {
+-    const binaryPath = join(
+-      globalBase,
+-      'vendor',
+-      'seccomp',
+-      arch,
+-      'apply-seccomp',
+-    )
+-    if (fs.existsSync(binaryPath)) {
+-      logForDebugging(
+-        `[SeccompFilter] Found apply-seccomp binary in global install: ${binaryPath} (${arch})`,
+-      )
+-      return binaryPath
+-    }
+-  }
+-
+   logForDebugging(
+diff --git a/src/sandbox/linux-sandbox-utils.ts b/src/sandbox/linux-sandbox-utils.ts
+--- a/src/sandbox/linux-sandbox-utils.ts
++++ b/src/sandbox/linux-sandbox-utils.ts
+@@ -570,7 +570,7 @@
+     !seccompConfig?.argv0 &&
+     getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
+   ) {
+-    warnings.push('seccomp not available - unix socket access not restricted')
++    errors.push('Required seccomp helper is unavailable or not executable')
+   }
+ 
+   return { warnings, errors }
+@@ -777,7 +777,10 @@
+     return `ARGV0=${quote([argv0])} ${quote([applyPath])} `
+   }
+   const binary = getApplySeccompBinaryPath(applyPath)
+-  return binary ? `${quote([binary])} ` : undefined
++  if (!binary) {
++    throw new Error('Required seccomp helper is unavailable or not executable')
++  }
++  return `${quote([binary])} `
+ }
+ 
+ /**
+diff --git a/src/sandbox/sandbox-manager.ts b/src/sandbox/sandbox-manager.ts
+--- a/src/sandbox/sandbox-manager.ts
++++ b/src/sandbox/sandbox-manager.ts
+@@ -1649,6 +1649,16 @@
+   // Wait for network initialization only if proxy is actually needed
+   if (needsNetworkProxy) {
+     await waitForNetworkInitialization()
++    // Broker storage may be read-denied. Restore only the relay endpoints,
++    // not their directory (which also contains private keys and settings).
++    const bridge = managerContext?.linuxBridge
++    if (bridge && readConfig) {
++      readConfig.allowWithinDeny = [
++        ...(readConfig.allowWithinDeny ?? []),
++        bridge.httpSocketPath,
++        bridge.socksSocketPath,
++      ]
++    }
+   }
+ 
+   // Check custom config to allow pseudo-terminal (can be applied dynamically)
+diff --git a/src/sandbox/http-proxy.ts b/src/sandbox/http-proxy.ts
+--- a/src/sandbox/http-proxy.ts
++++ b/src/sandbox/http-proxy.ts
+@@ -917,6 +917,18 @@
+     }
+   })
+ 
++  // Node's closeAllConnections omits upgraded CONNECT sockets. A half-open
++  // upstream must not keep reset() waiting after the workload has exited.
++  const connections = new Set<Socket>()
++  server.on('connection', socket => {
++    connections.add(socket)
++    socket.once('close', () => connections.delete(socket))
++  })
++  const closeHTTPConnections = server.closeAllConnections.bind(server)
++  server.closeAllConnections = () => {
++    for (const socket of connections) socket.destroy()
++    closeHTTPConnections()
++  }
+   return server
+ }
+ 
+diff --git a/src/cli.ts b/src/cli.ts
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -310,11 +310,12 @@
+           }
+ 
+           // Handle process exit
+-          child.on('exit', (code, signal) => {
++          child.on('exit', async (code, signal) => {
+             // Clean up bwrap mount point artifacts before exiting.
+             // On Linux, bwrap creates empty files on the host when protecting
+             // non-existent deny paths. This removes them.
+             SandboxManager.cleanupAfterCommand()
++            await SandboxManager.reset()
+ 
+             if (signal) {

@@ -11,7 +11,30 @@ let
   # such as .gitmodules. This host treats repository configuration as source,
   # while retaining SRT's separate .git/config and .git/hooks protections.
   sandbox-runtime = pkgsUnstable.sandbox-runtime.overrideAttrs (oldAttrs: {
-    patches = (oldAttrs.patches or [ ]) ++ [ ./sandbox-runtime-host-policy.patch ];
+    patches = (oldAttrs.patches or [ ]) ++ [
+      ./sandbox-runtime-host-policy.patch
+      ./sandbox-runtime-hardening.patch
+      ./sandbox-runtime-network.patch
+    ];
+    nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ [ pkgsUnstable.xxd ];
+    buildInputs = (oldAttrs.buildInputs or [ ]) ++ [ pkgsUnstable.libseccomp ];
+    # The upstream npm build only compiles TypeScript, not the native helper.
+    preBuild = (oldAttrs.preBuild or "") + ''
+      helper_dir=vendor/seccomp/${if pkgs.stdenv.hostPlatform.isx86_64 then "x64" else "arm64"}
+      mkdir -p "$helper_dir"
+      $CC -O2 -Wall -Wextra vendor/seccomp-src/seccomp-unix-block.c \
+        -lseccomp -o generate-seccomp
+      ./generate-seccomp unix-block.bpf ${
+        if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64"
+      }
+      xxd -i -n unix_block_bpf unix-block.bpf > "$helper_dir/unix-block-bpf.h"
+      $CC -O2 -Wall -Wextra -I "$helper_dir" vendor/seccomp-src/apply-seccomp.c \
+        -o "$helper_dir/apply-seccomp"
+      rm generate-seccomp unix-block.bpf "$helper_dir/unix-block-bpf.h"
+    '';
+    postInstall = (oldAttrs.postInstall or "") + ''
+      test -x "$out/lib/node_modules/@anthropic-ai/sandbox-runtime/$helper_dir/apply-seccomp"
+    '';
   });
 
   fishCompletionGenerator =
@@ -188,9 +211,17 @@ let
       chmod 0700 "$session_tmp"
       install -d -m 0700 "$session_tmp/claude"
 
-      settings_file="$(mktemp "$session_tmp/.srt-settings.XXXXXXXXXX")"
-      settings_inside="/tmp/''${settings_file##*/}"
-      trap 'rm -f "$settings_file"' EXIT
+      # SRT's CA keys and settings must never be created in workload-visible /tmp.
+      # This backing directory is hidden by denyRead; SRT rebinds only public
+      # trust files and the sockets needed by its trusted networking helpers.
+      # Mount it at /var/tmp below to avoid Unix socket path-length limits.
+      broker_tmp="$(mktemp -d "$workspace_tmp/.srt-broker.XXXXXXXX")"
+      settings_file="$broker_tmp/settings.json"
+      trap 'rm -rf -- "$broker_tmp"' EXIT
+      seccomp="${sandbox-runtime}/lib/node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/${
+        if pkgs.stdenv.hostPlatform.isx86_64 then "x64" else "arm64"
+      }/apply-seccomp"
+      [[ -x "$seccomp" ]] || { echo "required sandbox seccomp helper is unavailable" >&2; exit 69; }
 
       if [[ "$mode" == "shell" && -n "''${CREDENTIALS_DIRECTORY:-}" && -r "$CREDENTIALS_DIRECTORY/github-token" ]]; then
         GH_TOKEN="$(<"$CREDENTIALS_DIRECTORY/github-token")"
@@ -241,6 +272,7 @@ let
         --arg bwrap "${pkgs.bubblewrap}/bin/bwrap" \
         --arg rg "${pkgs.ripgrep}/bin/rg" \
         --arg socat "${pkgs.socat}/bin/socat" \
+        --arg seccomp "$seccomp" \
         '{
           filesystem: {
             denyRead: [
@@ -251,7 +283,8 @@ let
               $workspaces_root,
               $workspaces_tmp_root,
               $canonical_root,
-              $bridge_state
+              $bridge_state,
+              "/var/tmp"
             ],
             allowRead: [$root, ($home + "/.config/git"), ($home + "/.gitconfig")],
             allowWrite: [$root, "/tmp"],
@@ -332,6 +365,7 @@ let
           },
           bwrapPath: $bwrap,
           socatPath: $socat,
+          seccomp: { applyPath: $seccomp },
           ripgrep: { command: $rg },
           git: { safeDirectories: [$root] }
         }' > "$settings_file"
@@ -344,8 +378,12 @@ let
         --proc /proc \
         --bind "$root" "$root" \
         --bind "$session_tmp" /tmp \
+        --bind "$broker_tmp" /var/tmp \
+        --setenv TMPDIR /var/tmp \
+        --unsetenv TMP \
+        --unsetenv TEMP \
         --chdir "$cwd" \
-        -- ${sandbox-runtime}/bin/srt --settings "$settings_inside" -- "$@"
+        -- ${sandbox-runtime}/bin/srt --settings "$settings_file" -- "$@"
     '';
   };
 
@@ -662,5 +700,6 @@ in
     opencode-server
     opencode-workspace
     sandbox-exec
+    sandbox-runtime
     ;
 }

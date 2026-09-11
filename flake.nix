@@ -77,6 +77,13 @@
         github-bridge-vm = import ./tests/nixos/github-bridge.nix {
           inherit localPackages pkgs;
         };
+        sandbox-runtime = import ./tests/sandbox-runtime {
+          inherit pkgs;
+          sandboxRuntime = localPackages.sandbox-runtime;
+        };
+        sandbox-vm = import ./tests/nixos/sandbox.nix {
+          inherit localPackages pkgs;
+        };
         nixos = self.nixosConfigurations.opencode.config.system.build.toplevel;
       };
 

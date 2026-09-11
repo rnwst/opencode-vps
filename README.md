@@ -60,13 +60,66 @@ writes outside the current Git worktree and a session-private `/tmp`, where
 common language and package-manager caches are redirected. Temporary data is
 backed by `/srv/opencode/workspace-tmp/<WORKSPACE>/<SESSION_ID>` (with `.tasks`
 for automated workspaces), hidden from other sessions, and deleted with the
-session or workspace. It permits general outbound access while blocking local
-binding, Unix sockets, and TCP port 22. The real GitHub token and a precomputed
-HTTP Basic credential are replaced by independent sentinels inside the sandbox.
+session or workspace. Each invocation has its own network namespace: loopback
+listeners work inside that invocation, but do not expose host ports or another
+invocation's listeners. Outbound TCP uses SRT's public-destination-only proxy;
+Unix socket creation and TCP port 22 are blocked. The real GitHub token and a
+precomputed HTTP Basic credential are replaced by independent sentinels inside
+the sandbox.
 Git receives the masked credential through environment-based configuration, and
 Sandbox Runtime's TLS proxy restores it only in HTTPS requests to `github.com`.
 GitHub API clients use the separately masked token, restored for `github.com`
 and `api.github.com`.
+
+### Shell Sandbox Security
+
+The host patches the pinned Sandbox Runtime package in three ways:
+
+- Build its native `apply-seccomp` helper from the vendored source and configure
+  its immutable Nix-store path. Missing or non-executable helpers fail closed;
+  SRT does not fall back to a global npm installation. The helper blocks new
+  Unix socket creation and isolates workload processes from the proxy relays.
+- Check destination IP addresses in every outbound HTTP, CONNECT, SOCKS, and
+  TLS-terminated connection. Loopback, private, link-local, multicast, reserved,
+  and IPv4-transition address ranges are rejected, even for allowed hostnames.
+  DNS is resolved for each connection; mixed public/private answers fail closed,
+  and the checked address is used directly without a second lookup. This
+  prevents the host-side proxy from bypassing the workload's network namespace.
+- Create each invocation's settings, CA private keys, and broker temporary files
+  in a separate `.srt-broker.*` directory beneath the workspace's temporary root,
+  not the workload's `/tmp`. The outer sandbox mounts it at `/var/tmp` to keep
+  Unix-socket paths short even for long workspace names. Inner mounts hide both
+  the original backing path and `/var/tmp` from the workload, except
+  for read-only public trust files and the individual relay sockets needed by
+  trusted networking helpers. Normal command completion, including nonzero
+  exits, shuts down the proxy and removes this directory.
+
+Upstream HTTP proxy configuration (`HTTP_PROXY`, `HTTPS_PROXY`, and lowercase
+equivalents) and external MITM routing are unsupported by this host build: an
+upstream proxy could resolve destinations differently and bypass these checks.
+IPv6 egress is conservatively limited to native global-unicast space. Do not
+introduce network-specific NAT64 translation or host routing that maps otherwise
+public destinations into private networks without extending the egress policy.
+These checks cannot restrict what an allowed public server does on its own behalf.
+
+The restrictions apply to shell workloads, not the trusted OpenCode process or
+all of its built-in tools. They are not a general host firewall. The native
+filter blocks creation of Unix sockets, not operations on an already inherited
+socket, so do not pass host-service socket descriptors into workloads.
+
+Run the focused checks before deploying sandbox changes:
+
+```bash
+nix build .#checks.x86_64-linux.sandbox-runtime
+nix build .#checks.x86_64-linux.sandbox-vm
+```
+
+The first exercises real proxy implementations with controlled DNS and test
+connections, including rebinding and missing-helper regressions. The VM test
+uses the real wrapper under systemd hardening to verify Unix-socket restrictions,
+private-key invisibility, public TLS and masked GitHub authentication, private
+destination rejection, and temporary-file isolation/cleanup. It does not contact
+real GitHub services or use production credentials.
 
 These controls contain common prompt-injection outcomes such as credential
 theft, workspace escape, host persistence, sudo use, and Docker-socket escape.
