@@ -193,10 +193,11 @@ class Gateway:
                     and other.get("available")
                 ):
                     return True, origin
-        safe_paths = {"/"} if entry else {"/", "/previews"}
+        # App redirects retain the initiating navigation's cross-origin metadata.
+        # Preview documents can use any path, but still require their host cookie.
         navigation = (
             request.method == "GET"
-            and request.path in safe_paths
+            and (entry is not None or request.path in {"/", "/previews"})
             and request.headers.get("Sec-Fetch-Mode") == "navigate"
             and request.headers.get("Sec-Fetch-Dest") == "document"
         )

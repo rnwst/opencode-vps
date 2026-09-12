@@ -515,6 +515,38 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual((await response.json())["path"], path)
 
+    async def test_preview_document_navigation_requires_cookie_on_any_path(self):
+        nav = {
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+        }
+        for site in ("same-site", "cross-site", "none"):
+            for auth in (False, True):
+                with self.subTest(site=site, auth=auth):
+                    response = await self.request(
+                        "/trainings",
+                        auth=auth,
+                        headers={**nav, "Sec-Fetch-Site": site},
+                    )
+                    self.assertEqual(response.status, 200 if auth else 403)
+        nav["Sec-Fetch-Site"] = "same-site"
+        for method, changed in (
+            ("POST", {}),
+            ("GET", {"Sec-Fetch-Mode": "cors"}),
+            ("GET", {"Sec-Fetch-Mode": ""}),
+            ("GET", {"Sec-Fetch-Dest": "iframe"}),
+            ("GET", {"Sec-Fetch-Dest": ""}),
+            ("GET", {"Origin": "null"}),
+            ("GET", {"Cookie": gateway.COOKIE + "=wrong"}),
+        ):
+            with self.subTest(method=method, changed=changed):
+                before = len(self.requests)
+                response = await self.request(
+                    "/trainings", method=method, headers={**nav, **changed}
+                )
+                self.assertEqual(response.status, 403)
+                self.assertEqual(len(self.requests), before)
+
     async def test_preview_origin_policy_cross_port_and_cors(self):
         for headers, expected in [
             ({}, 200),
@@ -545,7 +577,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             "Sec-Fetch-Dest": "document",
         }
         self.assertEqual((await self.request(headers=nav)).status, 200)
-        self.assertEqual((await self.request("/api", headers=nav)).status, 403)
+        self.assertEqual((await self.request("/api", headers=nav)).status, 200)
         preflight = {
             "Origin": "https://" + SECOND,
             "Access-Control-Request-Method": "POST",
