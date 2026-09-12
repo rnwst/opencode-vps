@@ -6,6 +6,7 @@
   ...
 }:
 let
+  previewCfg = import ../config/previews.nix { inherit lib settings; };
   managedConfig = pkgs.writeText "opencode-managed.json" (
     builtins.toJSON {
       "$schema" = "https://opencode.ai/config.json";
@@ -56,7 +57,11 @@ let
         port = settings.opencodePort;
       };
       share = "disabled";
-      shell = "${localPackages.sandbox-exec}/bin/opencode-sandbox-exec";
+      shell =
+        if previewCfg.enable then
+          "${localPackages.opencode-preview}/bin/opencode-session-exec"
+        else
+          "${localPackages.sandbox-exec}/bin/opencode-sandbox-exec";
       snapshot = false;
     }
   );
@@ -153,7 +158,14 @@ in
     tunnels.${settings.cloudflareTunnelId} = {
       credentialsFile = settings.secrets.cloudflareCredentials;
       default = "http_status:404";
-      ingress.${settings.publicHostName} = "http://127.0.0.1:${toString settings.opencodePort}";
+      ingress = {
+        ${settings.publicHostName} = "http://127.0.0.1:${
+          toString (if previewCfg.enable then previewCfg.gatewayPort else settings.opencodePort)
+        }";
+      }
+      // lib.optionalAttrs previewCfg.enable {
+        "*.${previewCfg.domain}" = "http://127.0.0.1:${toString previewCfg.gatewayPort}";
+      };
     };
   };
 }

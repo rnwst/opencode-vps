@@ -15,6 +15,7 @@
     ../../modules/development.nix
     ../../modules/github-bridge.nix
     ../../modules/opencode.nix
+    ../../modules/opencode-previews.nix
     ../../modules/opencode-workspaces.nix
     ../../modules/ci-runner.nix
   ];

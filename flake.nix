@@ -84,6 +84,12 @@
         sandbox-vm = import ./tests/nixos/sandbox.nix {
           inherit localPackages pkgs;
         };
+        previews = import ./tests/previews { inherit pkgs; };
+        previews-vm = import ./tests/nixos/previews.nix { inherit pkgs pkgsUnstable; };
+        previews-browser = import ./tests/previews/browser.nix {
+          inherit pkgs;
+          previewPackage = localPackages.opencode-preview;
+        };
         nixos = self.nixosConfigurations.opencode.config.system.build.toplevel;
       };
 

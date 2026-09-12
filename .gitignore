@@ -3,3 +3,4 @@ opencode.json
 result
 result-*
 bootstrap-secrets/
+__pycache__/

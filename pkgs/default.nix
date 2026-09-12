@@ -6,6 +6,14 @@
 let
   inherit (pkgs) julia;
   inherit (pkgsUnstable) opencode;
+  previewCfg = import ../config/previews.nix {
+    inherit settings;
+    inherit (pkgs) lib;
+  };
+  opencode-preview = import ./opencode-preview {
+    inherit pkgs settings;
+    sandboxExec = sandbox-exec;
+  };
 
   # SRT's generic policy creates temporary mount points for repository files
   # such as .gitmodules. This host treats repository configuration as source,
@@ -215,7 +223,15 @@ let
       # This backing directory is hidden by denyRead; SRT rebinds only public
       # trust files and the sockets needed by its trusted networking helpers.
       # Mount it at /var/tmp below to avoid Unix socket path-length limits.
-      broker_tmp="$(mktemp -d "$workspace_tmp/.srt-broker.XXXXXXXX")"
+      if [[ -n "''${OPENCODE_PREVIEW_RUNTIME_ID:-}" ]]; then
+        [[ "$OPENCODE_PREVIEW_RUNTIME_ID" =~ ^[a-f0-9]{24}$ ]] || {
+          echo "invalid managed runtime ID" >&2; exit 77;
+        }
+        broker_tmp="${previewCfg.runtimeRoot}/broker/$OPENCODE_PREVIEW_RUNTIME_ID"
+        mkdir -m 0700 -- "$broker_tmp"
+      else
+        broker_tmp="$(mktemp -d "$workspace_tmp/.srt-broker.XXXXXXXX")"
+      fi
       settings_file="$broker_tmp/settings.json"
       trap 'rm -rf -- "$broker_tmp"' EXIT
       seccomp="${sandbox-runtime}/lib/node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/${
@@ -273,6 +289,7 @@ let
         --arg rg "${pkgs.ripgrep}/bin/rg" \
         --arg socat "${pkgs.socat}/bin/socat" \
         --arg seccomp "$seccomp" \
+        --arg preview_runtime "${previewCfg.runtimeRoot}" \
         '{
           filesystem: {
             denyRead: [
@@ -284,6 +301,7 @@ let
               $workspaces_tmp_root,
               $canonical_root,
               $bridge_state,
+              $preview_runtime,
               "/var/tmp"
             ],
             allowRead: [$root, ($home + "/.config/git"), ($home + "/.gitconfig")],
@@ -581,6 +599,15 @@ let
           if (input.event.type !== "session.deleted" || !workspaceTmp) return
           const sessionID = input.event.properties.info.id
           if (!/^ses_[A-Za-z0-9]+$/.test(sessionID)) return
+          ${pkgs.lib.optionalString previewCfg.enable ''
+            const stopped = Bun.spawn([
+              "${opencode-preview}/bin/opencode-session-exec", "stop",
+              "--session", sessionID, "--directory", directory,
+            ], { stdout: "ignore", stderr: "pipe" })
+            if (await stopped.exited !== 0) {
+              throw new Error("Could not stop the session runtime before removing temporary files")
+            }
+          ''}
           await rm(`''${workspaceTmp}/''${sessionID}`, { recursive: true, force: true })
         },
         "shell.env": async (input, output) => {
@@ -697,6 +724,7 @@ in
     opencode
     opencode-git
     opencode-plugin
+    opencode-preview
     opencode-server
     opencode-workspace
     sandbox-exec
