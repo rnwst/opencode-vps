@@ -107,6 +107,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.edge_requests = []
         self.external_requests = []
         self.derived_metadata = set()
+        self.root_redirect = None
         app = web.Application()
         app.router.add_route("*", "/{path:.*}", self.upstream)
         runner = web.AppRunner(app, access_log=None)
@@ -200,7 +201,9 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             return web.Response(status=401)
         if request.host == PUBLIC and request.path == "/":
             return web.Response(text=APP, content_type="text/html")
-        if request.path == "/":
+        if request.path == "/" and self.root_redirect:
+            return web.Response(status=302, headers={"Location": self.root_redirect})
+        if request.path in {"/", self.root_redirect}:
             response = web.Response(
                 text=APP, content_type="text/html", headers=POLICY_HEADERS
             )
@@ -338,7 +341,8 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         async with context.expect_page() as opened:
             await link.click()
         page = await opened.value
-        await page.wait_for_url(f"https://{host}/")
+        path = self.root_redirect or "/"
+        await page.wait_for_url(f"https://{host}{path}")
         await expect(page.locator("#app")).to_have_text("Socket app rendered")
         await expect(page.locator("#app")).to_be_visible()
         self.assertTrue(await page.evaluate("window.isSecureContext"))
@@ -379,7 +383,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         app = next(
             r
             for r in reversed(self.edge_requests)
-            if r["host"] == host and r["path"] == "/"
+            if r["host"] == host and r["path"] == path
         )
         self.assertEqual(app["status"], 200)
         for response in (login, app):
@@ -391,7 +395,9 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.no_overflow(page)
         return page
 
-    async def directory_login(self, mobile):
+    async def directory_login(self, mobile, redirect=False):
+        if redirect:
+            self.root_redirect = "/trainings"
         context = await self.context(mobile)
         page = await context.new_page()
         response = await page.goto(f"https://{FIRST}/")
@@ -405,6 +411,20 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         ).to_be_visible()
         await self.no_overflow(page)
         await self.open_preview(context, page, FIRST)
+        if redirect:
+            navigation = [
+                r
+                for r in self.edge_requests
+                if r["host"] == FIRST and r["headers"].get("cookie")
+            ]
+            self.assertEqual(
+                [(r["path"], r["status"]) for r in navigation],
+                [("/", 302), ("/trainings", 200)],
+            )
+            for request in navigation:
+                self.assertEqual(request["headers"]["sec-fetch-mode"], "navigate")
+                self.assertEqual(request["headers"]["sec-fetch-dest"], "document")
+                self.assertEqual(request["headers"]["sec-fetch-site"], "same-site")
         self.assertEqual(await context.cookies(f"https://{SECOND}/"), [])
         self.assertEqual(await context.cookies(f"https://{PUBLIC}/"), [])
         self.assertEqual(self.external_requests, [])
@@ -414,6 +434,12 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mobile_directory_login(self):
         await self.directory_login(mobile=True)
+
+    async def test_desktop_directory_login_with_app_redirect(self):
+        await self.directory_login(mobile=False, redirect=True)
+
+    async def test_mobile_directory_login_with_app_redirect(self):
+        await self.directory_login(mobile=True, redirect=True)
 
     async def test_browser_origin_isolation_and_same_runtime_cors(self):
         context = await self.context()
