@@ -381,6 +381,9 @@ main{max-width:64rem;margin:auto}header{border-bottom:3px solid #18212b;margin-b
 article{display:flex;justify-content:space-between;gap:1.5rem;padding:1.25rem 0;border-bottom:1px solid #bbc2c6}
 h2{font-size:1.1rem;margin:0}p{line-height:1.5}.path,code{overflow-wrap:anywhere}.actions{flex-shrink:0}
 a{color:#075a72}button{margin-top:1rem;padding:.6rem;border:1px solid #697b83;background:white;cursor:pointer}
+@media(prefers-color-scheme:dark){:root{color-scheme:dark}body{color:#e4e9ed;background:#18212b}
+header{border-color:#e4e9ed}article{border-color:#46545f}a{color:#7dd3e8}
+button{color:#e4e9ed;background:#25323e;border-color:#879ba5}}
 @media(max-width:600px){article{display:block}.actions{margin-top:1rem}}</style>
 <main><header><h1>OpenCode previews</h1><p>Persistent development sessions. <a href="/previews">Refresh</a></p></header>"""
         body += (
