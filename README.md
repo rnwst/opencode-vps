@@ -909,32 +909,19 @@ oca <REPOSITORY>
 to the existing server. Plain `opencode` would start a separate instance. To
 open a known session directly, run `oca <REPOSITORY> --session <SESSION_ID>`.
 
-### OpenCode Mobile
+### OpenCode Mobile App(s)
 
-[OpenCode Mobile](https://github.com/alvarolorentedev/opencode-mobile) is a
-community Android client. Configure it with:
+There are two community OpenCode mobile app options I have tested:
 
-```text
-Server URL: https://opencode.example.com
-Username:   opencode
-Password:   <server-password>
-```
+- <https://github.com/alvarolorentedev/opencode-mobile>
+- <https://github.com/dzianisv/opencode-mobile>
 
-Open **Workspace**, press **Sync projects**, select the repository, then choose
-or create a session. If a repository is missing, first open it and create a
-session in the browser so the server catalogs it.
-
-Use the app instead of the browser for text-to-speech, voice input and
-conversation mode, completion notifications, background checks, native
-attachments, and mobile permission handling. Otherwise the browser is simpler.
-The app stores connection credentials in Android `AsyncStorage`, so treat it as
-a privileged third-party client.
-
-The gateway preserves existing OpenCode Basic authentication and PTY ticket
-query semantics, including native Android requests without browser `Sec-Fetch-*`
-headers. Such requests still require upstream authentication; missing fetch
-metadata is not an authentication bypass. Preview links open in a browser using
-the trusted directory described below.
+[`alvarolorentedev`'s app](https://github.com/dzianisv/opencode-mobile) works
+on both iOS and Android, but appears to be much less polished than [`dzianisv`'s
+app](https://github.com/dzianisv/opencode-mobile), which only works on Android.
+OpenCode can of course also be used in a mobile browser, but the apps support
+voice input and mobile permission handling. To view previews, the browser must
+be used.
 
 ## Development Previews
 
