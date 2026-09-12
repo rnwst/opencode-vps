@@ -12,6 +12,7 @@ let
       "$schema" = "https://opencode.ai/config.json";
       autoupdate = false;
       enabled_providers = [ "openai" ];
+      model = "${settings.defaultModel.providerID}/${settings.defaultModel.modelID}";
       formatter.jlfmt = {
         command = [
           "jlfmt"
@@ -104,6 +105,7 @@ in
         HOME = "/home/rnwst-bot";
         OPENCODE_DISABLE_PROJECT_CONFIG = "1";
         OPENCODE_DISABLE_LSP_DOWNLOAD = "true";
+        OPENCODE_DISABLE_MODELS_FETCH = "false";
         PATH = lib.mkForce "/etc/profiles/per-user/rnwst-bot/bin:/run/current-system/sw/bin";
         XDG_CACHE_HOME = "/home/rnwst-bot/.cache";
         XDG_CONFIG_HOME = "/home/rnwst-bot/.config";

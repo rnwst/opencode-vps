@@ -5,7 +5,7 @@
 }:
 let
   inherit (pkgs) julia;
-  inherit (pkgsUnstable) opencode;
+  opencode = import ./opencode.nix { inherit pkgsUnstable; };
   previewCfg = import ../config/previews.nix {
     inherit settings;
     inherit (pkgs) lib;

@@ -205,7 +205,7 @@ class Config:
             ),
             agent=os.environ.get("GITHUB_BRIDGE_AGENT", "build"),
             provider_id=os.environ.get("GITHUB_BRIDGE_PROVIDER", "openai"),
-            model_id=os.environ.get("GITHUB_BRIDGE_MODEL", "gpt-5.6-sol"),
+            model_id=os.environ.get("GITHUB_BRIDGE_MODEL", "gpt-6-astra"),
             dry_run=os.environ.get("GITHUB_BRIDGE_DRY_RUN", "1") == "1",
             max_tasks=int(os.environ.get("GITHUB_BRIDGE_MAX_TASKS", "4")),
             retention_days=int(os.environ.get("GITHUB_BRIDGE_RETENTION_DAYS", "30")),

@@ -322,6 +322,36 @@ can be retired earlier to admit a new session. Session temporary files survive
 this cleanup. Servers and background jobs remain until explicit teardown or the
 configured maximum lifetime.
 
+### Default Models
+
+Configure models in `hosts/opencode/settings.nix`:
+
+| Setting | Default model |
+| ------- | ------------- |
+| `defaultModel` | `openai/gpt-6-astra-fast` |
+| `githubBridge.model` | `openai/gpt-6-astra` |
+
+List available IDs with `sudo -iu rnwst-bot opencode models` and rebuild after
+changing these settings. Explicit session selections take precedence over the
+OpenCode default. The bridge uses its configured model for each dispatch and
+leaves events pending if that model is unavailable.
+
+### Model Catalog Refresh
+
+OpenCode refreshes its catalog at startup and approximately hourly, independently
+of application updates. Existing workspaces can retain old model lists despite
+a new conversation or browser reload. To reload them, wait for active agent work
+to finish, then run on the VPS:
+
+```bash
+sudo -iu rnwst-bot opencode models --refresh
+sudo systemctl restart opencode.service
+```
+
+Reconnect the client and check its model picker. This briefly disconnects
+OpenCode clients but leaves preview servers running and existing model
+selections unchanged. No additional refresh timer or scheduled restart is used.
+
 ### GitHub Bridge Settings
 
 `githubBridge` selects one agent and model for all GitHub-triggered work. The
@@ -330,33 +360,6 @@ processed after the initial notification baseline. Set it to `true` before
 deployment when proposed actions should be reviewed first. The initial defaults
 allow four concurrent automated tasks, require 15 percent free space, and retain
 completed task snapshots for 30 days.
-
-To list models available to the bot account, run:
-
-```bash
-sudo -iu rnwst-bot opencode models
-```
-
-Each result has the form `<PROVIDER_ID>/<MODEL_ID>`. Set the corresponding
-values in `githubBridge.model`:
-
-```nix
-model = {
-  providerID = "openai";
-  modelID = "gpt-5.6-sol";
-};
-```
-
-Rebuild the host and run the bridge once after changing the model:
-
-```bash
-sudo nixos-rebuild switch --flake .#opencode
-sudo systemctl start github-bridge.service
-```
-
-The bridge validates that exact provider/model pair before allocating a task
-workspace, so an unavailable model leaves the GitHub event pending rather than
-silently using a fallback.
 
 ## 2. Create the Cloudflare Tunnel
 

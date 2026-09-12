@@ -15,6 +15,7 @@ import datetime as dt
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 SOURCE = Path(os.environ["GITHUB_BRIDGE_SOURCE"])
@@ -204,6 +205,21 @@ def subject(node_id: str, kind: str = "issue", number: int = 1) -> dict[str, Any
         "body": "Reference body from GitHub",
         "updated_at": "2026-09-02T00:00:00Z",
     }
+
+
+class ModelConfigTest(unittest.TestCase):
+    def test_default_model_is_regular_astra(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = bridge.Config.from_env()
+        self.assertEqual((config.provider_id, config.model_id), ("openai", "gpt-6-astra"))
+
+    def test_wrapper_model_selection_overrides_fallback(self):
+        with patch.dict(os.environ, {
+            "GITHUB_BRIDGE_PROVIDER": "test-provider",
+            "GITHUB_BRIDGE_MODEL": "test-model",
+        }, clear=True):
+            config = bridge.Config.from_env()
+        self.assertEqual((config.provider_id, config.model_id), ("test-provider", "test-model"))
 
 
 class BridgeTest(unittest.TestCase):

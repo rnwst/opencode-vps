@@ -1,4 +1,8 @@
 {
+  defaultModel = {
+    providerID = "openai";
+    modelID = "gpt-6-astra-fast";
+  };
   # This file contains the public, installation-specific values a new operator
   # should replace when reusing the repository.
   hostName = "opencode";
@@ -24,7 +28,7 @@
     agent = "build";
     model = {
       providerID = "openai";
-      modelID = "gpt-5.6-sol";
+      modelID = "gpt-6-astra";
     };
     maxConcurrentTasks = 4;
     minimumFreePercent = 15;
