@@ -23,11 +23,11 @@
     "fish-helix": {
       "flake": false,
       "locked": {
-        "lastModified": 1787356208,
-        "narHash": "sha256-Fj76kMMN3iIXA/mpa6MArZ5HEFl+7B+SxV5alhL5yno=",
+        "lastModified": 1788643581,
+        "narHash": "sha256-IBzj/c0mdjopK2fuJmG/3ot9+uKIUuVD/c/iC+gD+gw=",
         "owner": "rnwst",
         "repo": "fish-helix",
-        "rev": "cd895ebda363878e0187000f3e913f194d4aaf0e",
+        "rev": "b923103a3f3e70ba41b3f59a394d76ae09ae8802",
         "type": "github"
       },
       "original": {
