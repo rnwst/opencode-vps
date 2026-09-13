@@ -31,6 +31,7 @@
       gopls
       gotools
       gradle
+      haskell-language-server
       helix
       jdk
       jq
