@@ -520,7 +520,7 @@ let
       Bun.resolveSync("@opencode-ai/plugin", "/home/rnwst-bot/.config/opencode"),
     )
 
-    export const ManagedHost = async ({ directory }) => {
+    export const ManagedHost = async ({ directory, client }) => {
       let workspaceAllowed = false
       let workspaceTmp
       try {
@@ -538,6 +538,29 @@ let
         }
       } catch {}
 
+      // Descendants share their conversation's runtime, never an unrelated
+      // session's. Resolve ancestry from OpenCode, not tool-supplied metadata.
+      const rootSessionID = async (sessionID) => {
+        const seen = new Set()
+        while (seen.size < 64) {
+          if (typeof sessionID !== "string" || !/^ses_[A-Za-z0-9]+$/.test(sessionID) || seen.has(sessionID)) {
+            throw new Error("Invalid OpenCode session ancestry")
+          }
+          seen.add(sessionID)
+          const { data } = await client.session.get({
+            path: { id: sessionID },
+            query: { directory },
+            throwOnError: true,
+          })
+          if (!data || data.id !== sessionID || data.directory !== directory) {
+            throw new Error("OpenCode session does not match the managed workspace")
+          }
+          if (data.parentID === undefined) return sessionID
+          sessionID = data.parentID
+        }
+        throw new Error("OpenCode session ancestry is too deep")
+      }
+
       const tmpPathKeys = {
         edit: "filePath",
         glob: "path",
@@ -551,6 +574,10 @@ let
       // Privileged workspace changes cross a file-based request channel so the
       // OpenCode process never receives sudo access or an unmasked GitHub token.
       const managedRequest = async (operation, args, context) => {
+        if (!workspaceAllowed || context.directory !== directory) {
+          throw new Error("Managed GitHub operations require the current workspace")
+        }
+        const sessionID = await rootSessionID(context.sessionID)
         const timeout = 300000
         const requestID = randomUUID().replaceAll("-", "")
         const root = "${settings.githubBridge.stateRoot}"
@@ -561,7 +588,7 @@ let
           version: 1,
           operation,
           request_id: requestID,
-          session_id: context.sessionID,
+          session_id: sessionID,
           directory: context.directory,
           expires_at: Date.now() + timeout,
           arguments: args,
@@ -599,6 +626,7 @@ let
       return {
         event: async (input) => {
           if (input.event.type !== "session.deleted" || !workspaceTmp) return
+          // Deleting a child must not stop its root conversation's runtime.
           const sessionID = input.event.properties.info.id
           if (!/^ses_[A-Za-z0-9]+$/.test(sessionID)) return
           ${pkgs.lib.optionalString previewCfg.enable ''
@@ -614,7 +642,8 @@ let
         },
         "shell.env": async (input, output) => {
           if (!workspaceAllowed) throw new Error("Shells require a managed workspace")
-          output.env.OPENCODE_SESSION_ID = input.sessionID
+          if (input.sessionID === undefined) return
+          output.env.OPENCODE_SESSION_ID = await rootSessionID(input.sessionID)
         },
         "tool.execute.before": async (input, output) => {
           if (!workspaceAllowed) {
@@ -623,8 +652,8 @@ let
           ${pkgs.lib.optionalString previewCfg.enable ''
             if (input.tool.startsWith("playwright_")) {
               // MCP connections are project-scoped; route each call using the
-              // trusted OpenCode session, never a model-selected session ID.
-              output.args.__opencode_session_id = input.sessionID
+              // trusted root conversation, never a model-selected session ID.
+              output.args.__opencode_session_id = await rootSessionID(input.sessionID)
             }
           ''}
           const key = tmpPathKeys[input.tool]
@@ -641,7 +670,7 @@ let
               },
               async execute(args, context) {
                 await managedRequest("track_pr", { pr_url: args.pr_url }, context)
-                return `Registered ${"$"}{args.pr_url} with session ${"$"}{context.sessionID}`
+                return `Registered ${"$"}{args.pr_url} with this conversation`
               },
             }),
             github_manage_remote: tool({

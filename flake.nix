@@ -73,6 +73,10 @@
       };
 
       checks.${system} = {
+        opencode-plugin = import ./tests/opencode-plugin {
+          inherit pkgs settings;
+          plugin = localPackages.opencode-plugin;
+        };
         github-bridge = import ./tests/github-bridge { inherit pkgs; };
         github-bridge-vm = import ./tests/nixos/github-bridge.nix {
           inherit localPackages pkgs;
