@@ -59,6 +59,12 @@ separate, credential-free account. Do not invoke Docker directly from shells.
 
 ## Development previews
 
+Use Playwright MCP tools (`playwright_*`) to test previews at
+`http://localhost:PORT` or browse public websites.
+Read or copy needed browser output files through shell commands before closing
+the browser or its last tab. Tool errors and cancellation also clear browser
+state and remove those files.
+
 Start the project's normal HTTP server in the background and redirect its logs
 to `/tmp`. For example:
 

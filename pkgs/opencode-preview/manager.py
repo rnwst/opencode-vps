@@ -16,6 +16,15 @@ from pathlib import Path
 
 from aiohttp import web
 from launch import delegated_root
+from mcp_transport import (
+    MAX_MCP_REQUEST,
+    MAX_MCP_RESULT,
+    MCP_TIMEOUT,
+    home_directory,
+    reject_constant,
+    result_envelope,
+    validate_request,
+)
 
 MAX_FRAME = 256 * 1024
 SESSION = re.compile(r"ses_[A-Za-z0-9]+\Z")
@@ -72,6 +81,7 @@ class Runtime:
         self.last_heartbeat = 0
         self.last_exec_activity = self.created
         self.active_exec = None
+        self.active_mcp = None
         self.processes = None
         self.reported_ports = set()
         self.idle_since = None
@@ -96,6 +106,9 @@ class Runtime:
         async with self.write_lock:
             if frame["op"] == "exec":
                 self.active_exec = frame["id"]
+            elif frame["op"] == "mcp":
+                self.active_mcp = frame["id"]
+            if frame["op"] in {"exec", "mcp"}:
                 self.last_exec_activity = time.monotonic()
                 self.idle_since = None
             self.process.stdin.write(data)
@@ -109,7 +122,7 @@ class Runtime:
         request_id = secrets.token_hex(12)
         queue = asyncio.Queue(QUEUE_SIZE)
         self.channels[request_id] = (kind, queue)
-        if kind == "exec":
+        if kind in {"exec", "mcp"}:
             self.last_exec_activity = time.monotonic()
             self.idle_since = None
         return request_id, queue
@@ -161,12 +174,16 @@ class Runtime:
                     "end",
                     "closed",
                     "error",
+                    "mcp_data",
+                    "mcp_end",
                 }:
                     request_id = frame.get("id")
                     if not isinstance(request_id, str):
                         raise ValueError("invalid response id")
                     if kind == "data":
                         decode_data(frame)
+                    if kind == "mcp_data" and not 1 <= len(decode_data(frame)) <= 16384:
+                        raise ValueError("invalid MCP chunk")
                     if kind == "exit" and (
                         type(frame.get("code")) is not int
                         or not -64 <= frame["code"] <= 255
@@ -183,8 +200,17 @@ class Runtime:
                         self.active_exec = None
                         self.last_exec_activity = time.monotonic()
                         self.idle_since = None
+                    if kind in {"mcp_end", "error"} and request_id == self.active_mcp:
+                        self.active_mcp = None
+                        self.last_exec_activity = time.monotonic()
+                        self.idle_since = None
                     channel = self.channels.get(request_id)
                     if channel:
+                        if (
+                            channel[0] == "mcp"
+                            and kind not in {"mcp_data", "mcp_end", "error"}
+                        ) or (channel[0] != "mcp" and kind in {"mcp_data", "mcp_end"}):
+                            raise ValueError("invalid MCP channel response")
                         if (
                             kind == "data"
                             and channel[0] == "exec"
@@ -212,7 +238,11 @@ class Runtime:
                             )
                             await self.send(
                                 {
-                                    "op": "cancel" if channel[0] == "exec" else "close",
+                                    "op": {
+                                        "exec": "cancel",
+                                        "mcp": "mcp_cancel",
+                                        "tcp": "close",
+                                    }[channel[0]],
                                     "id": request_id,
                                 }
                             )
@@ -271,6 +301,10 @@ class Manager:
             value = self.config.get(key)
             if not isinstance(value, str) or not os.path.isabs(value):
                 raise ValueError(f"{key} must be an absolute path")
+        if "playwright_mcp" in self.config:
+            value = self.config["playwright_mcp"]
+            if not isinstance(value, str) or not os.path.isabs(value) or "\0" in value:
+                raise ValueError("playwright_mcp must be an absolute path")
         domain = self.config.get("preview_domain", "")
         if (
             not isinstance(domain, str)
@@ -295,6 +329,7 @@ class Manager:
     def create_control_app(self):
         app = web.Application(client_max_size=MAX_FRAME)
         app.router.add_post("/exec", self._exec)
+        app.router.add_post("/mcp", self._mcp)
         app.router.add_post("/stop", self._stop_request)
         return app
 
@@ -413,6 +448,11 @@ class Manager:
             self.config["python"],
             "--supervisor",
             self.config["supervisor"],
+            *(
+                ["--playwright-mcp", self.config["playwright_mcp"]]
+                if "playwright_mcp" in self.config
+                else []
+            ),
             cwd=runtime.directory,
             env=environment,
             stdin=asyncio.subprocess.PIPE,
@@ -524,7 +564,10 @@ class Manager:
             runtime.started
             and not runtime.stopped
             and runtime.active_exec is None
-            and not any(kind == "exec" for kind, _ in runtime.channels.values())
+            and runtime.active_mcp is None
+            and not any(
+                kind in {"exec", "mcp"} for kind, _ in runtime.channels.values()
+            )
             and not runtime.reported_ports
             and not runtime.listeners
             and runtime.processes == 0
@@ -621,6 +664,20 @@ class Manager:
             elif not runtime.ready.cancelled():
                 runtime.ready.exception()
             await self._kill_cgroup(runtime)
+            # /tmp is backed by session_tmp. A killed/unconfirmed namespace waiter
+            # cannot clean safely; only an empty runtime cgroup permits recovery.
+            if "playwright_mcp" in self.config:
+                with suppress(FileNotFoundError):
+                    fd = os.open(
+                        runtime.session_tmp,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    )
+                    try:
+                        info = os.fstat(fd)
+                        if (info.st_dev, info.st_ino) == runtime.tmp_identity:
+                            shutil.rmtree(home_directory(runtime.runtime_id), dir_fd=fd)
+                    finally:
+                        os.close(fd)
             broker_root = self.runtime_root / "broker"
             if broker_root.resolve(strict=True) != broker_root:
                 raise RuntimeError("invalid runtime broker root")
@@ -799,6 +856,94 @@ class Manager:
             if runtime.session_id == session and runtime.directory == directory:
                 await self.stop(runtime.runtime_id)
         return web.json_response({"stopped": True})
+
+    async def _mcp(self, request):
+        try:
+            body = await self._body(request, {"directory", "session_id", "request"})
+            try:
+                validate_request(body["request"])
+                encoded = frame_bytes(
+                    {"op": "mcp", "id": "0" * 24, "request": body["request"]}
+                )
+                if len(encoded) > MAX_MCP_REQUEST:
+                    raise ValueError("MCP request limit exceeded")
+            except (ValueError, TypeError, RecursionError, UnicodeError):
+                raise web.HTTPBadRequest(text="invalid MCP request") from None
+            if "playwright_mcp" not in self.config:
+                raise web.HTTPServiceUnavailable(text="MCP is not configured")
+            runtime, _ = await self._get_runtime(body["directory"], body["session_id"])
+            if runtime.active_mcp is not None or any(
+                kind == "mcp" for kind, _ in runtime.channels.values()
+            ):
+                raise web.HTTPConflict(text="session already has an active MCP request")
+            request_id, queue = runtime.channel("mcp")
+        except web.HTTPException as error:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": -32600 if error.status in {400, 413} else -32000,
+                        "message": error.text,
+                    }
+                },
+                status=error.status,
+            )
+        finished = False
+        result = bytearray()
+        try:
+            async with asyncio.timeout(MCP_TIMEOUT):
+                await runtime.send(
+                    {"op": "mcp", "id": request_id, "request": body["request"]}
+                )
+                while True:
+                    if request.transport is None or request.transport.is_closing():
+                        raise ConnectionError("MCP caller disconnected")
+                    try:
+                        frame = await asyncio.wait_for(queue.get(), 0.1)
+                    except asyncio.TimeoutError:
+                        continue
+                    if frame["event"] == "mcp_data":
+                        chunk = decode_data(frame)
+                        if len(result) + len(chunk) > MAX_MCP_RESULT:
+                            raise ValueError("MCP result limit exceeded")
+                        result.extend(chunk)
+                    elif frame["event"] == "mcp_end":
+                        envelope = json.loads(result, parse_constant=reject_constant)
+                        if not isinstance(envelope, dict) or set(envelope) not in (
+                            {"result"},
+                            {"error"},
+                        ):
+                            raise ValueError("invalid MCP envelope")
+                        result_envelope(envelope)
+                        # Return the already bounded UTF-8 body, without re-encoding images.
+                        result.decode("utf-8")
+                        finished = True
+                        return web.Response(
+                            body=bytes(result), content_type="application/json"
+                        )
+                    elif (
+                        frame["event"] == "error"
+                        and frame.get("error") == "MCP request timed out"
+                    ):
+                        raise asyncio.TimeoutError
+                    else:
+                        raise ValueError("MCP transport failed")
+        except asyncio.TimeoutError:
+            return web.json_response(
+                {"error": {"code": -32000, "message": "MCP request timed out"}},
+                status=504,
+            )
+        except (OSError, ValueError, TypeError, RecursionError):
+            return web.json_response(
+                {"error": {"code": -32000, "message": "MCP transport failed"}},
+                status=502,
+            )
+        finally:
+            runtime.last_exec_activity = time.monotonic()
+            runtime.idle_since = None
+            runtime.channels.pop(request_id, None)
+            if not finished:
+                with suppress(OSError, asyncio.TimeoutError):
+                    await runtime.send({"op": "mcp_cancel", "id": request_id})
 
     async def _exec(self, request):
         body = await self._body(request, {"directory", "session_id", "argv"})

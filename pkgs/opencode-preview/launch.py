@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--sandbox-exec", required=True)
     parser.add_argument("--python", required=True)
     parser.add_argument("--supervisor", required=True)
+    parser.add_argument("--playwright-mcp")
     args = parser.parse_args()
     group = Path(args.cgroup)
     root = delegated_root()
@@ -35,11 +36,17 @@ def main():
         or group.resolve(strict=True) != group
     ):
         parser.error("invalid runtime cgroup")
-    for value in (args.sandbox_exec, args.python, args.supervisor):
-        if not os.path.isabs(value):
+    executables = [args.sandbox_exec, args.python, args.supervisor]
+    if args.playwright_mcp is not None:
+        executables.append(args.playwright_mcp)
+    for value in executables:
+        if not os.path.isabs(value) or "\0" in value:
             parser.error("launch executables must be absolute trusted paths")
     (group / "cgroup.procs").write_text(str(os.getpid()))
-    command = "exec " + shlex.join([args.python, "-I", "-S", args.supervisor])
+    argv = [args.python, "-I", "-S", args.supervisor]
+    if args.playwright_mcp is not None:
+        argv.extend(["--playwright-mcp", args.playwright_mcp])
+    command = "exec " + shlex.join(argv)
     os.execv(args.sandbox_exec, [args.sandbox_exec, "-c", command])
 
 

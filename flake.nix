@@ -90,6 +90,11 @@
           inherit pkgs;
           previewPackage = localPackages.opencode-preview;
         };
+        playwright-mcp = import ./tests/previews/mcp-browser.nix {
+          inherit pkgs;
+          sandboxRuntime = localPackages.sandbox-runtime;
+          playwrightMcp = localPackages.playwright-mcp;
+        };
         nixos = self.nixosConfigurations.opencode.config.system.build.toplevel;
       };
 

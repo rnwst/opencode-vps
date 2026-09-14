@@ -6,6 +6,7 @@
 let
   inherit (pkgs) julia;
   opencode = import ./opencode.nix { inherit pkgsUnstable; };
+  playwright-mcp = import ./playwright-mcp.nix { inherit pkgs; };
   previewCfg = import ../config/previews.nix {
     inherit settings;
     inherit (pkgs) lib;
@@ -13,6 +14,7 @@ let
   opencode-preview = import ./opencode-preview {
     inherit pkgs settings;
     sandboxExec = sandbox-exec;
+    playwrightMcp = playwright-mcp;
   };
 
   # SRT's generic policy creates temporary mount points for repository files
@@ -618,6 +620,13 @@ let
           if (!workspaceAllowed) {
             throw new Error("Tools are restricted to ${settings.workspacesRoot}")
           }
+          ${pkgs.lib.optionalString previewCfg.enable ''
+            if (input.tool.startsWith("playwright_")) {
+              // MCP connections are project-scoped; route each call using the
+              // trusted OpenCode session, never a model-selected session ID.
+              output.args.__opencode_session_id = input.sessionID
+            }
+          ''}
           const key = tmpPathKeys[input.tool]
           if (key && isTmpPath(output.args?.[key])) {
             throw new Error("Direct file tools cannot access shell temporary files; use bash")
@@ -727,6 +736,7 @@ in
     opencode-preview
     opencode-server
     opencode-workspace
+    playwright-mcp
     sandbox-exec
     sandbox-runtime
     ;

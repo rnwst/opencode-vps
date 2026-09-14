@@ -13,6 +13,14 @@ let
       autoupdate = false;
       enabled_providers = [ "openai" ];
       model = "${settings.defaultModel.providerID}/${settings.defaultModel.modelID}";
+      mcp = lib.optionalAttrs previewCfg.enable {
+        playwright = {
+          type = "local";
+          command = [ "${localPackages.opencode-preview}/bin/opencode-session-mcp" ];
+          enabled = true;
+          timeout = 130000;
+        };
+      };
       formatter.jlfmt = {
         command = [
           "jlfmt"

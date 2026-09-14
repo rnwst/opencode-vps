@@ -4,6 +4,7 @@ The launcher supplies an already-masked environment and the native PID 1 owns
 namespace teardown. There are no workload-accessible control listeners.
 """
 
+import argparse
 import array
 import base64
 import binascii
@@ -23,6 +24,10 @@ import termios
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# -I excludes the script directory; only add the immutable packaged source.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mcp_transport import MCPChild
 
 MAX_FRAME = 256 * 1024
 MAX_COMMAND = 128 * 1024
@@ -138,18 +143,20 @@ class Stream:
 
 
 class Supervisor:
-    def __init__(self):
+    def __init__(self, playwright_mcp=None):
         self.workspace = Path.cwd().resolve()
         self.environment = dict(os.environ)
         self.selector = selectors.DefaultSelector()
         self.input = bytearray()
         self.output = collections.deque()
         self.output_size = 0
+        self.written = 0
         self.streams = {}
         self.pipes = set()
         self.command = None
         self.kills = {}
         self.running = True
+        self.mcp = MCPChild(self, playwright_mcp)
 
     def watch(self, file, events, data=None):
         try:
@@ -176,6 +183,7 @@ class Supervisor:
         self.output.append(memoryview(encoded))
         self.output_size += len(encoded)
         self.watch(1, selectors.EVENT_WRITE, ("output", None))
+        return self.written + self.output_size
 
     def error(self, id, message):
         self.emit("error", id, error=message[:256])
@@ -188,6 +196,7 @@ class Supervisor:
         except BlockingIOError:
             return
         self.output_size -= size
+        self.written += size
         self.output[0] = self.output[0][size:]
         if not self.output[0]:
             self.output.popleft()
@@ -230,6 +239,8 @@ class Supervisor:
                 "data": {"op", "id", "data"},
                 "end": {"op", "id"},
                 "close": {"op", "id"},
+                "mcp": {"op", "id", "request"},
+                "mcp_cancel": {"op", "id"},
             }
             if (
                 not isinstance(op, str)
@@ -237,7 +248,20 @@ class Supervisor:
                 or set(request) != schemas[op]
             ):
                 raise ValueError
-            if op == "exec":
+            if op == "mcp":
+                if len(line) > MAX_COMMAND:
+                    raise ValueError
+                if (
+                    id in self.streams
+                    or id in self.kills
+                    or (self.command and self.command.id == id)
+                ):
+                    self.error(id, "id in use")
+                else:
+                    self.mcp.call(id, request["request"])
+            elif op == "mcp_cancel":
+                self.mcp.cancel(id)
+            elif op == "exec":
                 argv, cwd = request["argv"], request["cwd"]
                 if (
                     len(line) > MAX_COMMAND
@@ -253,7 +277,12 @@ class Supervisor:
                 if not resolved.is_relative_to(self.workspace) or not resolved.is_dir():
                     self.error(id, "cwd is outside workspace or not a directory")
                     return
-                if self.command is not None or id in self.streams or id in self.kills:
+                if (
+                    self.command is not None
+                    or id in self.streams
+                    or id in self.kills
+                    or id == self.mcp.id
+                ):
                     self.error(id, "exec busy or id in use")
                     return
                 if len(self.pipes) >= 256:
@@ -292,6 +321,7 @@ class Supervisor:
                     id in self.streams
                     or (self.command and self.command.id == id)
                     or id in self.kills
+                    or id == self.mcp.id
                 ):
                     self.error(id, "id in use")
                 elif len(self.streams) >= MAX_STREAMS:
@@ -446,6 +476,7 @@ class Supervisor:
     def refresh(self):
         now = time.monotonic()
         self.poll_command()
+        self.mcp.refresh(self.output_size < OUTPUT_HIGH)
         for id, (pid, deadline) in list(self.kills.items()):
             if now >= deadline:
                 self.signal_group(pid, signal.SIGKILL)
@@ -507,31 +538,43 @@ class Supervisor:
                         self.read_pipe(item)
                     elif kind == "stream":
                         self.service_stream(item, events)
+                    elif kind == "mcp":
+                        self.mcp.service(item, events)
         finally:
             self.shutdown()
 
     def shutdown(self):
-        groups = {pipe.command.process.pid for pipe in self.pipes}
-        groups.update(pid for pid, _ in self.kills.values())
-        if self.command:
-            groups.add(self.command.process.pid)
-        for pid in groups:
-            self.signal_group(pid, signal.SIGKILL)
-        for pipe in list(self.pipes):
-            self.close_pipe(pipe)
-        if self.command:
-            self.command.process.wait(timeout=3)
-        for stream in self.streams.values():
-            if stream.sock is not None:
-                stream.sock.close()
-        self.streams.clear()
-        self.selector.close()
+        try:
+            self.mcp.shutdown()
+        finally:
+            groups = {pipe.command.process.pid for pipe in self.pipes}
+            groups.update(pid for pid, _ in self.kills.values())
+            if self.command:
+                groups.add(self.command.process.pid)
+            for pid in groups:
+                self.signal_group(pid, signal.SIGKILL)
+            for pipe in list(self.pipes):
+                self.close_pipe(pipe)
+            if self.command:
+                self.command.process.wait(timeout=3)
+            for stream in self.streams.values():
+                if stream.sock is not None:
+                    stream.sock.close()
+            self.streams.clear()
+            self.selector.close()
 
 
 def main():
     try:
         secure_process()
-        Supervisor().run()
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--playwright-mcp")
+        args = parser.parse_args()
+        if args.playwright_mcp is not None and (
+            not os.path.isabs(args.playwright_mcp) or "\0" in args.playwright_mcp
+        ):
+            parser.error("MCP launcher must be an absolute trusted path")
+        Supervisor(args.playwright_mcp).run()
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
         print(
             "sandbox supervisor stopped: security or control failure", file=sys.stderr
