@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -247,6 +247,7 @@ def integration(wrapper, config_path, task):
     assert Path(config["playwright_mcp"]).is_file()
     assert "cpu_quota" not in config
     assert 0 < config["memory_max"] <= 1024 * 1024 * 1024
+    assert config["max_execs"] == 2
 
     def client(workspace, session, *args, expected=0):
         result = subprocess.run(
@@ -274,6 +275,44 @@ def integration(wrapper, config_path, task):
 
     def shell(workspace, session, command, **kwargs):
         return client(workspace, session, "-c", command, **kwargs)
+
+    @contextmanager
+    def held(name, code=0):
+        # A real foreground shell, released only by a host-controlled gate.
+        program = (
+            "import os, signal, sys, time; from pathlib import Path; "
+            f"signal.alarm(90); p = Path('parallel-{name}'); "
+            "p.with_suffix('.ready').write_text(str(os.getpid()))\n"
+            "while not p.with_suffix('.release').exists(): time.sleep(0.05)\n"
+            f"print('{name}-out'); print('{name}-err', file=sys.stderr); sys.exit({code})"
+        )
+        process = subprocess.Popen(
+            [wrapper, "-c", "exec python3 -c " + shlex.quote(program)],
+            cwd=root / "alpha",
+            user="rnwst-bot",
+            group="agent-workspaces",
+            extra_groups=[],
+            env={
+                **os.environ,
+                "HOME": "/home/rnwst-bot",
+                "OPENCODE_SESSION_ID": "ses_alpha",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            eventually(lambda: present(root / f"alpha/parallel-{name}.ready"))
+            assert process.poll() is None
+            yield process
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=10)
 
     def mcp(workspace, session, name, arguments, expected=200, tool_error=False):
         # Exercise the private manager API, not a separately launched test MCP.
@@ -855,63 +894,95 @@ def integration(wrapper, config_path, task):
     assert ready(a)["login"] == entry_a["login"]
     assert login(a, entry_a) == cookie_a
     content(a, cookie_a, "alpha restarted")
-    child = subprocess.Popen(
-        [wrapper, "-c", "echo $$ > cancel.pid; exec sleep 120"],
-        cwd=root / "alpha",
-        user="rnwst-bot",
-        group="agent-workspaces",
-        extra_groups=[],
-        env={
-            **os.environ,
-            "HOME": "/home/rnwst-bot",
-            "OPENCODE_SESSION_ID": "ses_alpha",
-        },
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    print(
+        "Checking configured parallel shell slots and independent results", flush=True
     )
-    try:
-        eventually(lambda: present(root / "alpha/cancel.pid"))
+    with held("first", 17) as first, held("second", 23) as second:
+        assert first.poll() is None and second.poll() is None
+        commands = (
+            Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            for pid in snapshot(entry_a)[1]
+        )
+        supervisor = next(
+            argv
+            for argv in commands
+            if argv[1:4] == [b"-I", b"-S", config["supervisor"].encode()]
+        )
+        assert supervisor[supervisor.index(b"--max-execs") + 1] == b"2"
+        shell("alpha", "ses_alpha", "touch parallel-rejected", expected=77)
+        assert not (root / "alpha/parallel-rejected").exists()
+        result = mcp(
+            "alpha",
+            "ses_alpha",
+            "browser_evaluate",
+            {"function": "() => document.body.innerText"},
+        )
+        assert "alpha source" in json.dumps(result), result
+        assert ready(a) == entry_a and login(a, entry_a) == cookie_a
+        content(a, cookie_a, "alpha restarted")
+        for name, process, code in (("first", first, 17), ("second", second, 23)):
+            (root / f"alpha/parallel-{name}.release").touch()
+            output = process.communicate(timeout=10)
+            assert (process.returncode, *output) == (
+                code,
+                name + "-out\n",
+                name + "-err\n",
+            )
+            if process is first:
+                assert second.poll() is None
+        assert not (root / "alpha/parallel-rejected").exists()
+
+    with held("cancel") as child, held("survivor") as survivor:
         child.send_signal(signal.SIGTERM)
         stdout, stderr = child.communicate(timeout=10)
         assert child.returncode == 143, (child.returncode, stdout, stderr)
-    finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait()
-    eventually(
-        lambda: shell("alpha", "ses_alpha", "! kill -0 $(cat cancel.pid) 2>/dev/null")
-    )
-    content(a, cookie_a, "alpha restarted")
-
-    print(
-        "Checking scoped stop and workspace deletion kill background processes",
-        flush=True,
-    )
-    snap_a = snapshot(entry_a, browser=True)
-    client(
-        "alpha",
-        "ses_alpha",
-        "stop",
-        "--session",
-        "ses_alpha",
-        "--directory",
-        str(root / "beta"),
-    )
-    content(a, cookie_a, "alpha restarted")
-    content(b, cookie_b, "beta source")
-    client(
-        "alpha",
-        "ses_alpha",
-        "stop",
-        "--session",
-        "ses_alpha",
-        "--directory",
-        str(root / "alpha"),
-    )
-    eventually(lambda: cleaned(snap_a))
+        # Client exit alone is not proof that the actual workload was reaped.
+        eventually(
+            lambda: shell(
+                "alpha",
+                "ses_alpha",
+                "! kill -0 $(cat parallel-cancel.ready) 2>/dev/null",
+            )
+        )
+        assert survivor.poll() is None
+        with held("replacement") as replacement:
+            assert survivor.poll() is None and replacement.poll() is None
+            assert ready(a) == entry_a and login(a, entry_a) == cookie_a
+            content(a, cookie_a, "alpha restarted")
+            print(
+                "Checking scoped stop kills multiple foreground calls and background processes",
+                flush=True,
+            )
+            snap_a = snapshot(entry_a, browser=True)
+            client(
+                "alpha",
+                "ses_alpha",
+                "stop",
+                "--session",
+                "ses_alpha",
+                "--directory",
+                str(root / "beta"),
+            )
+            content(a, cookie_a, "alpha restarted")
+            content(b, cookie_b, "beta source")
+            assert survivor.poll() is None and replacement.poll() is None
+            client(
+                "alpha",
+                "ses_alpha",
+                "stop",
+                "--session",
+                "ses_alpha",
+                "--directory",
+                str(root / "alpha"),
+            )
+            for process in (survivor, replacement):
+                output = process.communicate(timeout=10)
+                assert process.returncode != 0, output
+            eventually(lambda: cleaned(snap_a))
     gone(a)
     gone("preview-alpha-3001.example.com")
     content(b, cookie_b, "beta source")
+    assert shell("beta", "ses_beta", "printf unrelated-exec") == "unrelated-exec"
     # Rename away the workspace root while leaving its open cwd and files alive.
     (root / "beta").rename(root / "beta-deleted")
     eventually(lambda: gone(b))

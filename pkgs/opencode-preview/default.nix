@@ -38,6 +38,7 @@ let
       memory_max = cfg.memoryMax;
       tasks_max = cfg.tasksMax;
       max_runtimes = cfg.maxRuntimes;
+      max_execs = cfg.maxExecs;
       max_ports = cfg.maxPorts;
       max_connections = cfg.maxConnections;
       max_lifetime_seconds = cfg.maxLifetimeSeconds;

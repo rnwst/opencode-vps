@@ -16,6 +16,8 @@ let
       # Shared pool for the concurrent Chromium sessions, not a per-runtime cap.
       memoryMax = 1073741824;
       tasksMax = 256;
+      # Nondefault value exercises settings -> manager -> sandbox supervisor.
+      maxExecs = 2;
     };
     # Immutable, explicitly fake credentials, not operator secret paths.
     secrets = {

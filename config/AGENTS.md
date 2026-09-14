@@ -90,7 +90,7 @@ curl --noproxy '*' http://127.0.0.1:3000/
 - HTTP and WebSockets are supported. Service workers are blocked, and
   `Authorization` headers are stripped before app forwarding. Use host-only
   cookies for app authentication, never parent-domain cookies.
-- The runtime permits one active shell command and one browser call at a time.
+- Shell calls can run in parallel (four by default); serialize browser calls.
   Runtime reset or expiry stops background jobs; restart intended servers when
   needed. Ask the operator to resolve ownership conflicts or resource limits
   rather than bypassing them.

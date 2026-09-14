@@ -37,7 +37,7 @@ libc = ctypes.CDLL(None)
 assert libc.prctl(38, 1, 0, 0, 0) == 0
 assert libc.prctl(4, 0, 0, 0, 0) == 0
 assert libc.prctl(3, 0, 0, 0, 0) == 0
-module.Supervisor().run()
+module.Supervisor(**({'max_execs': int(sys.argv[2])} if len(sys.argv) > 2 else {})).run()
 """
 
 
@@ -47,14 +47,19 @@ class ProtocolTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.workspace = Path(self.temp.name) / "workspace"
         self.workspace.mkdir()
-        self.frames = queue.Queue()
-        self.pending = []
-        self.sequence = 0
         # Deliberately inheritable: close_fds must remove this in commands.
         self.extra = os.open(self.temp.name, os.O_RDONLY | os.O_DIRECTORY)
         self.addCleanup(os.close, self.extra)
+        self.start_worker()
+
+    def start_worker(self, max_execs=None):
+        self.frames = queue.Queue()
+        self.pending = []
+        self.sequence = 0
+        self.withheld = set()
+        args = [] if max_execs is None else [str(max_execs)]
         self.process = subprocess.Popen(
-            [sys.executable, "-B", "-I", "-S", "-c", LAUNCHER, str(SOURCE)],
+            [sys.executable, "-B", "-I", "-S", "-c", LAUNCHER, str(SOURCE), *args],
             cwd=self.workspace,
             env={"PATH": os.defpath, "MASKED_TEST": "allowed"},
             stdin=subprocess.PIPE,
@@ -116,17 +121,26 @@ class ProtocolTests(unittest.TestCase):
                 self.fail(f"timeout waiting for {event}/{id}: {self.pending}")
             if frame is None:
                 self.fail(f"supervisor exited while waiting for {event}/{id}")
+            if (
+                frame.get("event") == "data"
+                and "stream" in frame
+                and frame["id"] not in self.withheld
+            ):
+                self.send({"op": "exec_credit", "id": frame["id"], "credits": 1})
             self.pending.append(frame)
 
-    def execute(self, code, cwd=None):
+    def execute(self, code, cwd=None, credits=15, ack=True):
         self.sequence += 1
         id = format(self.sequence, "x")
+        if not ack:
+            self.withheld.add(id)
         self.send(
             {
                 "op": "exec",
                 "id": id,
                 "argv": [sys.executable, "-I", "-S", "-c", code],
                 "cwd": str(cwd or self.workspace),
+                "credits": credits,
             }
         )
         return id
@@ -212,15 +226,32 @@ for suffix in ('fd/0', 'fd/1', 'fd/2', 'mem'):
             {"op": "wat", "id": "aa"},
             {"op": "cancel", "id": "not-hex"},
             {"op": [], "id": "aa"},
-            {"op": "exec", "id": "aa", "argv": [], "cwd": "."},
-            {"op": "exec", "id": "aa", "argv": [1], "cwd": "."},
-            {"op": "exec", "id": "aa", "argv": ["a\0b"], "cwd": "."},
-            {"op": "exec", "id": "aa", "argv": ["true"], "cwd": ".", "env": {}},
+            {"op": "exec", "id": "aa", "argv": [], "cwd": ".", "credits": 15},
+            {"op": "exec", "id": "aa", "argv": [1], "cwd": ".", "credits": 15},
+            {"op": "exec", "id": "aa", "argv": ["a\0b"], "cwd": ".", "credits": 15},
+            {
+                "op": "exec",
+                "id": "aa",
+                "argv": ["true"],
+                "cwd": ".",
+                "credits": 15,
+                "env": {},
+            },
+            {
+                "op": "exec",
+                "id": "aa",
+                "argv": ["true"],
+                "cwd": ".",
+                "credits": 15,
+                "max_execs": 2,
+            },
+            {"op": "exec", "id": "aa", "argv": ["true"], "cwd": "."},
             {
                 "op": "exec",
                 "id": "aa",
                 "argv": ["a" * supervisor.MAX_COMMAND],
                 "cwd": ".",
+                "credits": 15,
             },
         ]
         invalid += [
@@ -244,19 +275,181 @@ for suffix in ('fd/0', 'fd/1', 'fd/2', 'mem'):
             pass
         self.assertNotEqual(self.process.wait(timeout=5), 0)
 
-    def test_one_exec_and_cancel_escalates(self):
-        id = self.execute(
-            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(60)"
-        )
-        self.event("data", id)
+    def held_command(self, ignore_term=False):
+        gate = f"release-{self.sequence + 1:x}"
+        id = self.execute(f"""
+import os, signal, time
+if {ignore_term!r}:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print(os.getpid(), flush=True)
+while not os.path.exists({gate!r}):
+    time.sleep(0.01)
+""")
+        pid = int(base64.b64decode(self.event("data", id)["data"]))
+        return id, pid
+
+    def test_default_four_overlap_and_fifth_rejected(self):
+        held = [self.held_command() for _ in range(4)]
+        for _, pid in held:
+            os.kill(pid, 0)
         other = self.execute("pass")
         self.assertIn("busy", self.event("error", other)["error"])
-        start = time.monotonic()
-        self.send({"op": "cancel", "id": id})
-        self.assertEqual(self.event("exit", id)["code"], -signal.SIGKILL)
-        self.assertGreaterEqual(time.monotonic() - start, 1.9)
+        for id, _ in reversed(held):
+            (self.workspace / f"release-{id}").touch()
+            self.assertEqual(self.event("exit", id)["code"], 0)
         id = self.execute("pass")
         self.assertEqual(self.event("exit", id)["code"], 0)
+
+    def test_configurable_one_and_two(self):
+        for limit in (1, 2):
+            with self.subTest(limit=limit):
+                self.stop()
+                self.start_worker(limit)
+                held = [self.held_command() for _ in range(limit)]
+                other = self.execute("pass")
+                self.assertIn("busy", self.event("error", other)["error"])
+                for id, _ in held:
+                    gate = self.workspace / f"release-{id}"
+                    gate.touch()
+                    self.assertEqual(self.event("exit", id)["code"], 0)
+                    gate.unlink()
+                id = self.execute("pass")
+                self.assertEqual(self.event("exit", id)["code"], 0)
+
+    def test_cancel_one_escalates_without_freeing_slot_or_stopping_others(self):
+        id, _ = self.held_command(ignore_term=True)
+        others = [self.held_command() for _ in range(3)]
+        start = time.monotonic()
+        self.send({"op": "cancel", "id": id})
+        self.send({"op": "cancel", "id": id})
+        rejected = self.execute("pass")
+        self.assertIn("busy", self.event("error", rejected)["error"])
+        released, _ = others.pop()
+        (self.workspace / f"release-{released}").touch()
+        self.assertEqual(self.event("exit", released)["code"], 0)
+        replacement = self.held_command()
+        rejected = self.execute("pass")
+        self.assertIn("busy", self.event("error", rejected)["error"])
+        self.event("ports")
+        self.assertEqual(self.event("exit", id)["code"], -signal.SIGKILL)
+        self.assertGreaterEqual(time.monotonic() - start, 1.9)
+        for other, pid in [*others, replacement]:
+            os.kill(pid, 0)
+            (self.workspace / f"release-{other}").touch()
+            self.assertEqual(self.event("exit", other)["code"], 0)
+        id = self.execute("pass")
+        self.assertEqual(self.event("exit", id)["code"], 0)
+
+    def test_binary_streams_interleave_and_exit_out_of_order(self):
+        ids = []
+        payloads = {}
+        for index in range(4):
+            stdout = bytes(range(256)) * (128 + index)
+            stderr = bytes(reversed(range(256))) * (129 + index)
+            id = self.execute(f"""
+import os, time
+out = bytes(range(256)) * {128 + index}
+err = bytes(reversed(range(256))) * {129 + index}
+for offset in range(0, max(len(out), len(err)), 1024):
+    os.write(1, out[offset:offset + 1024])
+    os.write(2, err[offset:offset + 1024])
+    time.sleep(0.001)
+while not os.path.exists('release-{index}'):
+    time.sleep(0.01)
+os._exit({index})
+""")
+            ids.append(id)
+            payloads[id] = (stdout, stderr)
+        # Every process must produce output before any is allowed to finish.
+        for id in ids:
+            frame = self.event("data", id)
+            self.pending.insert(0, frame)
+        for index in (2, 0, 3, 1):
+            id = ids[index]
+            (self.workspace / f"release-{index}").touch()
+            self.assertEqual(self.event("exit", id)["code"], index)
+            self.assertEqual(self.output(id), payloads[id][0])
+            self.assertEqual(self.output(id, "stderr"), payloads[id][1])
+            self.assertFalse(any(frame["event"] == "exit" for frame in self.pending))
+
+    def test_active_exec_ids_reject_exec_tcp_and_mcp(self):
+        held = [self.held_command() for _ in range(3)]
+        for id, _ in held:
+            for request in (
+                {"op": "exec", "id": id, "argv": ["true"], "cwd": ".", "credits": 15},
+                {"op": "connect", "id": id, "port": 8000},
+                {"op": "mcp", "id": id, "request": {}},
+            ):
+                self.send(request)
+                self.assertIn("id in use", self.event("error", id)["error"])
+        for id, pid in held:
+            os.kill(pid, 0)
+            (self.workspace / f"release-{id}").touch()
+            self.assertEqual(self.event("exit", id)["code"], 0)
+
+    def test_shutdown_reaps_all_active_commands(self):
+        held = [self.held_command(ignore_term=True) for _ in range(4)]
+        self.send({"op": "cancel", "id": held[1][0]})
+        self.process.stdin.close()
+        self.assertEqual(self.process.wait(timeout=3), 0)
+        for _, pid in held:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_cancel_waits_for_descendant_escalation_after_leader_exits(self):
+        id = self.execute("""
+import os, signal, time
+r, w = os.pipe()
+pid = os.fork()
+if not pid:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    os.write(w, b'x')
+    while True:
+        time.sleep(60)
+os.read(r, 1)
+print(os.getpid(), pid, flush=True)
+time.sleep(60)
+""")
+        leader, child = map(
+            int, base64.b64decode(self.event("data", id)["data"]).split()
+        )
+        self.addCleanup(self.kill_background, child)
+        others = [self.held_command() for _ in range(3)]
+        self.send({"op": "cancel", "id": id})
+        deadline = time.monotonic() + 1.5
+        while Path(f"/proc/{leader}").exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        rejected = self.execute("pass")
+        self.assertIn("busy", self.event("error", rejected)["error"])
+        for request in (
+            {"op": "exec", "id": id, "argv": ["true"], "cwd": ".", "credits": 15},
+            {"op": "connect", "id": id, "port": 8000},
+            {"op": "mcp", "id": id, "request": {}},
+        ):
+            self.send(request)
+            self.assertIn("id in use", self.event("error", id)["error"])
+        self.assertEqual(self.event("exit", id)["code"], -signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                state = (
+                    Path(f"/proc/{child}/stat")
+                    .read_bytes()
+                    .rsplit(b")", 1)[1]
+                    .split()[0]
+                )
+            except FileNotFoundError:
+                break
+            # Orphan reaping belongs to namespace PID 1, absent from this fixture.
+            if state == b"Z":
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        replacement = self.execute("pass")
+        self.assertEqual(self.event("exit", replacement)["code"], 0)
+        for _, pid in others:
+            os.kill(pid, 0)
 
     def start_background(self, host="127.0.0.1"):
         code = f"""
@@ -445,8 +638,133 @@ os.replace('received.tmp', 'received')
         self.process.stdin.close()
         self.assertEqual(self.process.wait(timeout=3), 0)
 
+    def test_credit_starved_command_does_not_block_peers_and_resumes_losslessly(self):
+        slow = self.execute(
+            """
+import os
+out = bytes(range(256)) * 4096
+err = bytes(reversed(range(256))) * 4096
+for offset in range(0, len(out), 4096):
+    os.write(1, out[offset:offset + 4096])
+    os.write(2, err[offset:offset + 4096])
+""",
+            credits=2,
+            ack=False,
+        )
+        received = [self.event("data", slow) for _ in range(2)]
+        healthy = self.execute(
+            "import os; os.write(1, b'healthy'); os.write(2, b'err')"
+        )
+        self.assertEqual(self.event("exit", healthy)["code"], 0)
+        self.assertEqual(self.output(healthy), b"healthy")
+        self.assertEqual(self.output(healthy, "stderr"), b"err")
+        self.send(
+            {
+                "op": "mcp",
+                "id": "ca",
+                "request": {
+                    "method": "tools/call",
+                    "params": {"name": "browser_tabs", "arguments": {}},
+                },
+            }
+        )
+        self.assertEqual(self.event("error", "ca")["error"], "MCP is not configured")
+        self.event("ports")
+        self.assertFalse(any(frame.get("id") == slow for frame in self.pending))
+        self.pending[0:0] = received
+        self.withheld.remove(slow)
+        self.send({"op": "exec_credit", "id": slow, "credits": 2})
+        self.assertEqual(self.event("exit", slow, timeout=10)["code"], 0)
+        self.assertEqual(self.output(slow), bytes(range(256)) * 4096)
+        self.assertEqual(
+            self.output(slow, "stderr"), bytes(reversed(range(256))) * 4096
+        )
+
+    def test_terminal_does_not_require_ack_and_late_acks_are_harmless(self):
+        id = self.execute("import os; os.write(1, b'\\x00\\xff')", credits=1, ack=False)
+        self.assertEqual(self.event("exit", id)["code"], 0)
+        self.assertEqual(self.output(id), b"\x00\xff")
+        for late in (id, "ffff"):
+            self.send({"op": "exec_credit", "id": late, "credits": 1})
+        fence = self.execute("pass")
+        self.assertEqual(self.event("exit", fence)["code"], 0)
+        self.assertFalse(any(frame["event"] == "error" for frame in self.pending))
+
+    def test_cancel_credit_starved_command_releases_slot_without_acks(self):
+        self.stop()
+        self.start_worker(1)
+        id = self.execute(
+            """
+import os, signal
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    os.write(1, b'x' * 16384)
+    os.write(2, b'y' * 16384)
+""",
+            credits=1,
+            ack=False,
+        )
+        self.event("data", id)
+        self.event("ports")
+        self.assertFalse(any(frame.get("id") == id for frame in self.pending))
+        self.send({"op": "cancel", "id": id})
+        rejected = self.execute("pass")
+        self.assertIn("busy", self.event("error", rejected)["error"])
+        self.assertEqual(self.event("exit", id)["code"], -signal.SIGKILL)
+        self.assertFalse(any(frame.get("id") == id for frame in self.pending))
+        replacement = self.execute("print('replacement')")
+        self.assertEqual(self.event("exit", replacement)["code"], 0)
+        self.assertEqual(self.output(replacement), b"replacement\n")
+
 
 class SecurityTests(unittest.TestCase):
+    def test_max_execs_constructor_validation_and_positional_mcp(self):
+        for value in (True, False, 0, -1, 1.0, "4", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                supervisor.Supervisor(max_execs=value)
+        for limit in (1, 2, 4):
+            worker = supervisor.Supervisor("/trusted/mcp", limit)
+            self.addCleanup(worker.selector.close)
+            self.assertEqual(worker.max_execs, limit)
+            self.assertEqual(worker.mcp.executable, "/trusted/mcp")
+        worker = supervisor.Supervisor("/trusted/mcp")
+        self.addCleanup(worker.selector.close)
+        self.assertEqual(worker.max_execs, 4)
+
+    def test_max_execs_cli(self):
+        for args, limit, mcp in (
+            ([], 4, None),
+            (["--max-execs", "1"], 1, None),
+            (
+                ["--playwright-mcp", "/trusted/mcp", "--max-execs", "2"],
+                2,
+                "/trusted/mcp",
+            ),
+        ):
+            with (
+                self.subTest(args=args),
+                mock.patch.object(supervisor, "secure_process"),
+                mock.patch.object(supervisor.sys, "argv", ["supervisor", *args]),
+                mock.patch.object(supervisor, "Supervisor") as worker,
+            ):
+                self.assertEqual(supervisor.main(), 0)
+                worker.assert_called_once_with(mcp, max_execs=limit)
+                worker.return_value.run.assert_called_once_with()
+        for value in ("0", "-1", "1.5", "true", "nope"):
+            with (
+                self.subTest(value=value),
+                mock.patch.object(supervisor, "secure_process"),
+                mock.patch.object(
+                    supervisor.sys, "argv", ["supervisor", "--max-execs", value]
+                ),
+                mock.patch.object(supervisor.sys, "stderr"),
+                mock.patch.object(supervisor, "Supervisor") as worker,
+                self.assertRaises(SystemExit) as error,
+            ):
+                supervisor.main()
+            self.assertEqual(error.exception.code, 2)
+            worker.assert_not_called()
+
     def status(self, **changes):
         fields = {
             "CapEff": "0000000000000000",
@@ -644,7 +962,348 @@ class ResourceTests(unittest.TestCase):
         self.worker.emit = mock.Mock()
 
     def request(self, **request):
+        if request.get("op") == "exec":
+            request.setdefault("credits", 15)
         self.worker.request(json.dumps(request).encode())
+
+    def test_exec_credit_validation_and_initial_window_cap(self):
+        with (
+            mock.patch.object(supervisor.subprocess, "Popen") as popen,
+            mock.patch.object(supervisor.os, "set_blocking"),
+        ):
+            for credits in (True, False, 0, -1, 129, 1.0, "1", None, [], {}):
+                for op in ("exec", "exec_credit"):
+                    with self.subTest(credits=credits, op=op):
+                        fields = {"argv": ["true"], "cwd": "."} if op == "exec" else {}
+                        self.request(op=op, id="a", credits=credits, **fields)
+                        self.worker.emit.assert_called_with(
+                            "error", "a", error="invalid request"
+                        )
+            popen.assert_not_called()
+            for request in (
+                {"op": "exec", "id": "a", "argv": ["true"], "cwd": "."},
+                {"op": "exec_credit", "id": "a"},
+                {"op": "exec_credit", "id": "a", "credits": 1, "extra": 1},
+            ):
+                self.worker.request(json.dumps(request).encode())
+                self.worker.emit.assert_called_with(
+                    "error", "a", error="invalid request"
+                )
+            for id, credits in (("a", 1), ("b", 128)):
+                self.request(op="exec", id=id, argv=["true"], cwd=".", credits=credits)
+                command = self.worker.commands[id]
+                self.assertEqual(command.credits, credits)
+                self.assertEqual(command.window, credits)
+                self.request(op="exec_credit", id=id, credits=1)
+                self.worker.emit.assert_called_with(
+                    "error", id, error="invalid request"
+                )
+                self.assertEqual(command.credits, credits)
+                pipe = next(
+                    pipe for pipe in self.worker.pipes if pipe.command is command
+                )
+                with mock.patch.object(supervisor.os, "read", return_value=b"x"):
+                    self.worker.read_pipe(pipe)
+                self.assertEqual(command.credits, credits - 1)
+                self.request(op="exec_credit", id=id, credits=2)
+                self.worker.emit.assert_called_with(
+                    "error", id, error="invalid request"
+                )
+                self.assertEqual(command.credits, credits - 1)
+                self.worker.emit.reset_mock()
+                self.request(op="exec_credit", id=id, credits=1)
+                self.worker.emit.assert_not_called()
+                self.assertEqual(command.credits, credits)
+
+    def test_credit_shared_between_pipes_and_cancel_discards_above_high_water(self):
+        worker = self.worker
+        process = mock.Mock(pid=999)
+        process.poll.return_value = None
+        command = supervisor.Command("a", process, credits=1)
+        worker.commands["a"] = command
+        stdout = supervisor.Pipe(mock.Mock(), command, "stdout")
+        stderr = supervisor.Pipe(mock.Mock(), command, "stderr")
+        worker.pipes.update((stdout, stderr))
+
+        def snapshot(fd, op, result, mutate):
+            result[0] = supervisor.CHUNK
+
+        with (
+            mock.patch.object(worker, "watch") as watch,
+            mock.patch.object(worker, "signal_group") as kill,
+            mock.patch.object(
+                supervisor.os, "read", return_value=b"x" * supervisor.CHUNK
+            ) as read,
+            mock.patch.object(supervisor.fcntl, "ioctl", side_effect=snapshot),
+            mock.patch.object(supervisor.time, "monotonic", return_value=10) as clock,
+        ):
+            worker.read_pipe(stdout)
+            worker.read_pipe(stderr)
+            read.assert_called_once()
+            self.assertEqual(command.credits, 0)
+            worker.refresh()
+            watch.assert_any_call(stdout.file, 0, ("pipe", stdout))
+            watch.assert_any_call(stderr.file, 0, ("pipe", stderr))
+            worker.output_size = supervisor.OUTPUT_HIGH
+            self.request(op="cancel", id="a")
+            self.assertTrue(command.discard)
+            self.assertFalse(command.finished)
+            worker.refresh()
+            watch.assert_any_call(
+                stdout.file, supervisor.selectors.EVENT_READ, ("pipe", stdout)
+            )
+            watch.assert_any_call(
+                stderr.file, supervisor.selectors.EVENT_READ, ("pipe", stderr)
+            )
+            worker.read_pipe(stdout)
+            self.assertEqual(read.call_count, 2)
+            process.poll.return_value = -signal.SIGTERM
+            worker.refresh()
+            self.assertEqual(read.call_count, 4)
+            self.assertEqual(stdout.remaining, 0)
+            self.assertEqual(stderr.remaining, 0)
+            self.assertIn("a", worker.commands)
+            worker.emit.assert_called_once()
+            clock.return_value = 12
+            worker.refresh()
+            worker.emit.assert_called_with("exit", "a", code=-signal.SIGTERM)
+            self.assertNotIn("a", worker.commands)
+            self.assertTrue(command.finished)
+            self.assertEqual(command.credits, 0)
+            kill.assert_has_calls(
+                [mock.call(999, signal.SIGTERM), mock.call(999, signal.SIGKILL)]
+            )
+            worker.emit.reset_mock()
+            self.request(op="exec_credit", id="a", credits=1)
+            worker.emit.assert_not_called()
+
+    def test_starting_commands_count_and_ids_span_all_operations(self):
+        with (
+            mock.patch.object(supervisor.subprocess, "Popen") as popen,
+            mock.patch.object(supervisor.os, "set_blocking"),
+            mock.patch.object(self.worker.mcp, "call") as mcp,
+            mock.patch.object(self.worker, "dial") as dial,
+        ):
+            for id in ("a", "b", "c"):
+                self.request(op="exec", id=id, argv=["true"], cwd=".")
+            self.assertEqual(popen.call_count, 3)
+            self.assertEqual(set(self.worker.commands), {"a", "b", "c"})
+            self.worker.kills["d"] = (999, time.monotonic() + 2)
+            self.worker.streams["e"] = supervisor.Stream("e", 8000)
+            self.worker.mcp.id = "f"
+            for id in ("a", "b", "c", "d", "e", "f"):
+                for request in (
+                    {"op": "exec", "argv": ["true"], "cwd": "."},
+                    {"op": "connect", "port": 8000},
+                    {"op": "mcp", "request": {}},
+                ):
+                    # MCPChild itself owns the busy check for its active request.
+                    if id == "f" and request["op"] == "mcp":
+                        continue
+                    self.request(id=id, **request)
+                    self.assertIn(
+                        "id in use", self.worker.emit.call_args.kwargs["error"]
+                    )
+            self.assertEqual(popen.call_count, 3)
+            mcp.assert_not_called()
+            dial.assert_not_called()
+            self.request(op="exec", id="10", argv=["true"], cwd=".")
+            self.assertEqual(popen.call_count, 4)
+            self.request(op="exec", id="11", argv=["true"], cwd=".")
+            self.assertEqual(popen.call_count, 4)
+            self.worker.emit.assert_called_with(
+                "error", "11", error="exec busy or id in use"
+            )
+
+    def test_simultaneous_exit_snapshots_are_bounded_fair_and_resume(self):
+        worker = self.worker
+        worker.emit = supervisor.Supervisor.emit.__get__(worker)
+        worker.watch = mock.Mock()
+        queued = 1024 * 1024 + 2 * supervisor.CHUNK
+        available = {}
+        pipes = []
+        for index in range(4):
+            id = format(index, "x")
+            process = mock.Mock()
+            process.poll.return_value = index
+            command = supervisor.Command(id, process, credits=15)
+            worker.commands[id] = command
+            for name in ("stdout", "stderr"):
+                fd = len(pipes) + 10
+                file = mock.Mock()
+                file.fileno.return_value = fd
+                pipe = supervisor.Pipe(file, command, name)
+                pipes.append(pipe)
+                available[fd] = queued
+                worker.pipes.add(pipe)
+
+        def snapshot(fd, op, result, mutate):
+            result[0] = available[fd]
+
+        def read(fd, size):
+            count = min(size, available[fd])
+            available[fd] -= count
+            return bytes([fd]) * count
+
+        captured = {(pipe.command.id, pipe.stream): bytearray() for pipe in pipes}
+        exits = []
+
+        def consume():
+            for encoded in worker.output:
+                frame = json.loads(bytes(encoded))
+                if frame["event"] == "data":
+                    self.assertNotIn(frame["id"], exits)
+                    captured[frame["id"], frame["stream"]].extend(
+                        base64.b64decode(frame["data"])
+                    )
+                    self.request(op="exec_credit", id=frame["id"], credits=1)
+                elif frame["event"] == "exit":
+                    id = frame["id"]
+                    self.assertEqual(frame["code"], int(id, 16))
+                    self.assertEqual(len(captured[id, "stdout"]), queued)
+                    self.assertEqual(len(captured[id, "stderr"]), queued)
+                    exits.append(id)
+            worker.output.clear()
+            worker.output_size = 0
+
+        with (
+            mock.patch.object(supervisor.fcntl, "ioctl", side_effect=snapshot) as ioctl,
+            mock.patch.object(supervisor.os, "read", side_effect=read) as reads,
+            mock.patch.object(worker.mcp, "refresh") as mcp,
+        ):
+            worker.output_size = supervisor.OUTPUT_HIGH
+            worker.refresh()
+            reads.assert_not_called()
+            mcp.assert_called_once_with(False)
+            self.assertEqual(ioctl.call_count, 8)
+            self.assertTrue(all(pipe.remaining == queued for pipe in pipes))
+            self.assertEqual(len(worker.commands), 4)
+            # No new slot or ID is available while terminal output is draining.
+            self.request(op="exec", id="a", argv=["true"], cwd=".")
+            for id in worker.commands:
+                self.request(op="connect", id=id, port=8000)
+                self.request(op="mcp", id=id, request={})
+            self.assertEqual(len(worker.output), 9)
+            self.assertTrue(
+                all(
+                    json.loads(bytes(frame))["event"] == "error"
+                    for frame in worker.output
+                )
+            )
+            consume()
+            # Later descendant bytes must not extend the foreground snapshot.
+            for fd in available:
+                available[fd] += 123
+            progressed = set()
+            for _ in range(4):
+                worker.output_size = supervisor.OUTPUT_HIGH - 1
+                before = sum(available.values())
+                worker.poll_commands()
+                self.assertLessEqual(before - sum(available.values()), supervisor.CHUNK)
+                self.assertLessEqual(
+                    worker.output_size, supervisor.OUTPUT_HIGH + 2 * supervisor.CHUNK
+                )
+                progressed.update(
+                    json.loads(bytes(frame))["id"] for frame in worker.output
+                )
+                consume()
+            self.assertEqual(progressed, {"0", "1", "2", "3"})
+
+            iterations = 0
+            while worker.commands:
+                before = sum(available.values())
+                worker.refresh()
+                self.assertLessEqual(
+                    before - sum(available.values()), 2 * supervisor.CHUNK
+                )
+                self.assertLessEqual(
+                    worker.output_size, supervisor.OUTPUT_HIGH + 2 * supervisor.CHUNK
+                )
+                if (
+                    worker.output_size >= supervisor.OUTPUT_HIGH
+                    or not worker.commands
+                    or all(not command.credits for command in worker.commands.values())
+                ):
+                    consume()
+                iterations += 1
+                self.assertLess(iterations, 1000)
+            self.assertEqual(set(exits), {"0", "1", "2", "3"})
+            self.assertEqual(ioctl.call_count, 8)
+            self.assertEqual(mcp.call_count, iterations + 1)
+            mcp.assert_any_call(True)
+            for pipe in pipes:
+                fd = pipe.file.fileno()
+                self.assertEqual(
+                    captured[pipe.command.id, pipe.stream], bytes([fd]) * queued
+                )
+                self.assertEqual(available[fd], 123)
+                self.assertEqual(pipe.command.process.poll.call_count, 1)
+            worker.output_size = supervisor.OUTPUT_HIGH
+            for pipe in pipes:
+                worker.read_pipe(pipe)
+            self.assertTrue(all(count == 0 for count in available.values()))
+            self.assertFalse(worker.output)
+
+    def test_stale_readiness_respects_new_high_water_but_writes_continue(self):
+        worker = self.worker
+        worker.emit = supervisor.Supervisor.emit.__get__(worker)
+        worker.watch = mock.Mock()
+        worker.output_size = supervisor.OUTPUT_HIGH - 1
+        pipe = supervisor.Pipe(
+            mock.Mock(), supervisor.Command("a", mock.Mock(), credits=15), "stdout"
+        )
+        stream = supervisor.Stream(
+            "b", 8000, sock=mock.Mock(), connecting=False, pending=bytearray(b"x")
+        )
+        worker.streams["b"] = stream
+        stream.sock.send.return_value = 1
+        with mock.patch.object(
+            supervisor.os, "read", return_value=b"x" * supervisor.CHUNK
+        ) as read:
+            worker.read_pipe(pipe)
+            self.assertGreaterEqual(worker.output_size, supervisor.OUTPUT_HIGH)
+            worker.read_pipe(pipe)
+            read.assert_called_once()
+            worker.service_stream(
+                stream,
+                supervisor.selectors.EVENT_READ | supervisor.selectors.EVENT_WRITE,
+            )
+            stream.sock.recv.assert_not_called()
+            stream.sock.send.assert_called_once_with(b"x")
+            self.assertFalse(stream.pending)
+
+    def test_shutdown_signals_every_group_before_reaping(self):
+        processes = []
+        for index in range(4):
+            process = mock.Mock(pid=100 + index)
+            self.worker.commands[str(index)] = supervisor.Command(
+                str(index), process, credits=15
+            )
+            processes.append(process)
+        self.worker.kills["a"] = (200, 0)
+        background = supervisor.Command(
+            "b", mock.Mock(pid=300), credits=15, finished=True
+        )
+        pipe = supervisor.Pipe(mock.Mock(), background, "stdout")
+        self.worker.pipes.add(pipe)
+        with (
+            mock.patch.object(self.worker, "signal_group") as kill,
+            mock.patch.object(self.worker, "watch"),
+        ):
+            for process in processes:
+                process.wait.side_effect = lambda **kwargs: self.assertEqual(
+                    kill.call_count, 6
+                )
+            self.worker.shutdown()
+            self.assertEqual(
+                {call.args for call in kill.call_args_list},
+                {(pid, signal.SIGKILL) for pid in (100, 101, 102, 103, 200, 300)},
+            )
+        for process in processes:
+            process.wait.assert_called_once_with(timeout=3)
+        self.assertFalse(self.worker.commands)
+        self.assertFalse(self.worker.kills)
+        self.assertFalse(self.worker.pipes)
 
     def test_each_ports_heartbeat_includes_process_count(self):
         iterations = iter((True, False))
@@ -744,8 +1403,14 @@ class ResourceTests(unittest.TestCase):
         )
 
     def test_output_backpressure_pauses_producers_not_writes_or_discard(self):
-        pipe = supervisor.Pipe(mock.Mock(), mock.Mock(finished=False), "stdout")
-        discarded = supervisor.Pipe(mock.Mock(), mock.Mock(finished=True), "stdout")
+        pipe = supervisor.Pipe(
+            mock.Mock(), supervisor.Command("a", mock.Mock(), credits=15), "stdout"
+        )
+        discarded = supervisor.Pipe(
+            mock.Mock(),
+            supervisor.Command("b", mock.Mock(), credits=15, finished=True),
+            "stdout",
+        )
         self.worker.pipes.update((pipe, discarded))
         stream = supervisor.Stream(
             "a", 8000, sock=mock.Mock(), connecting=False, pending=bytearray(b"x")

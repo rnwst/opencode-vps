@@ -333,6 +333,7 @@ label of `publicHostName`: `opencode.example.com` becomes `example.com`.
 | `gatewayPort` | `4080` | Loopback gateway, distinct from OpenCode port 4096 |
 | `runtimeRoot` | `/run/opencode-previews` | Fixed protected path; changing it is rejected |
 | `maxRuntimes` | `4` | Host-wide concurrent session/workspace runtimes |
+| `maxExecs` | `4` | Simultaneous foreground shell calls per runtime |
 | `maxPorts` | `128` | Distinct ports discovered over one runtime's lifetime |
 | `maxConnections` | `128` | Per-runtime connection/channel limit |
 | `memoryMax` | `9663676416` (9 GiB) | Combined cgroup memory ceiling for all runtimes, in bytes |
@@ -350,8 +351,8 @@ with the victim. Continued pressure can still kill further runtimes.
 
 CPU has no hard quota. Equal cgroup weights share CPU between busy runtimes and
 allow a lone compilation to use spare CPUs. The old `cpuQuota` setting is no
-longer accepted. Shell/browser call concurrency and per-runtime process limits
-are unchanged.
+longer accepted. Shell calls share the runtime's CPU, memory, process, and
+channel limits; increasing `maxExecs` does not grant additional resources.
 
 Size the memory pool below physical RAM to leave room for host services and
 OpenCode. The ceiling covers charged resident memory, not RAM plus swap; swap
@@ -994,9 +995,12 @@ runtime survives the shell call, and later calls in the same session can reach
 clients, for example `curl --noproxy '*' http://127.0.0.1:3000/`). Persistence
 means processes and shared loopback, not retained shell variables or `cd` state.
 Subagents share their root conversation's runtime, including browser state and
-temporary files. Coordinate calls: only one shell command and one browser call
-can be active at a time. Unrelated conversations cannot share that runtime; stop
-its runtime before switching ownership.
+temporary files. Up to `maxExecs` shell calls (four by default) can run at once,
+with independent output, exit status, and cancellation. Starting, draining, and
+terminating calls count toward the limit; excess calls are rejected, not queued.
+Parallelize independent commands, not operations that contend for Git state or
+the same build files. Browser calls remain serialized. Unrelated conversations
+cannot share that runtime; stop its runtime before switching ownership.
 
 Visit the trusted Basic-authenticated directory at
 `https://opencode.example.com/previews`. It lists workspace, session, port, and
