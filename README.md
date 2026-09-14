@@ -62,13 +62,18 @@ The command sandbox denies bot-home reads except Git configuration. It denies
 writes outside the current Git worktree and a session-private `/tmp`, where
 common language and package-manager caches are redirected. Temporary data is
 backed by `/srv/opencode/workspace-tmp/<WORKSPACE>/<SESSION_ID>` (with `.tasks`
-for automated workspaces), hidden from other sessions, and deleted with the
-session or workspace. With previews enabled, shell calls in the same OpenCode
-session/workspace share a persistent runtime and private network namespace:
+for automated workspaces), hidden from unrelated conversations, and deleted with
+the root session or workspace. The managed plugin resolves subagent ancestry
+through OpenCode's API and uses the root session ID for shell, browser, and
+managed GitHub operations. Descendants share their root's `/tmp` and PR feedback
+mapping; deleting a child does not stop or remove the root's runtime or files.
+With previews enabled, shell calls in the same conversation/workspace share a
+persistent runtime and private network namespace:
 background processes and loopback listeners survive between calls, without
 exposing host ports or another session's listeners. Shell variables and changes
 to the working directory do not carry over; each call starts a new shell.
-Only one session can own an active runtime and publish previews per workspace.
+Only one root conversation can own an active runtime and publish previews per
+workspace, including calls from its subagents.
 CLI calls without `OPENCODE_SESSION_ID` retain the existing single-shot sandbox
 behavior, with a fresh network namespace and teardown after each invocation.
 Outbound TCP uses SRT's public-destination-only proxy;
@@ -974,8 +979,10 @@ runtime survives the shell call, and later calls in the same session can reach
 `127.0.0.1:3000` directly (bypass HTTP proxy environment variables for local
 clients, for example `curl --noproxy '*' http://127.0.0.1:3000/`). Persistence
 means processes and shared loopback, not retained shell variables or `cd` state.
-Other sessions cannot share that runtime. Only one session can publish from a
-workspace at a time; stop its runtime before switching ownership.
+Subagents share their root conversation's runtime, including browser state and
+temporary files. Coordinate calls: only one shell command and one browser call
+can be active at a time. Unrelated conversations cannot share that runtime; stop
+its runtime before switching ownership.
 
 Visit the trusted Basic-authenticated directory at
 `https://opencode.example.com/previews`. It lists workspace, session, port, and
@@ -1000,7 +1007,7 @@ app, its configuration, or a preview URL.
 
 Tokens last for the runtime's lifetime, not 60 seconds, and are reusable while
 the port is available. Restarting an app server on the same port within that
-runtime keeps its token. Stop/reset, runtime failure, lifetime expiry, session
+runtime keeps its token. Stop/reset, runtime failure, lifetime expiry, root session
 deletion, or workspace deletion revokes access. Restarting
 `opencode-previews.service` or rebooting ends all runtimes and revokes all their
 tokens. A fresh runtime gets new tokens even if its hostnames are unchanged.
