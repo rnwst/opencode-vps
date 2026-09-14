@@ -54,6 +54,8 @@ in
         RestartSec = "3s";
         TimeoutStopSec = "30s";
         KillMode = "control-group";
+        # Pool OOM kills a selected runtime, not the manager or its siblings.
+        OOMPolicy = "continue";
         Delegate = [
           "cpu"
           "memory"

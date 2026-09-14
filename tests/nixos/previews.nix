@@ -13,9 +13,9 @@ let
     };
     previews = {
       domain = "example.com";
+      # Shared pool for the concurrent Chromium sessions, not a per-runtime cap.
       memoryMax = 1073741824;
       tasksMax = 256;
-      cpuQuota = 75;
     };
     # Immutable, explicitly fake credentials, not operator secret paths.
     secrets = {
@@ -39,6 +39,8 @@ pkgs.testers.nixosTest {
     };
     virtualisation.memorySize = 4096;
     virtualisation.cores = 2;
+    # Exercise pool-local OOM without a panic, but still fail on VM-wide OOM.
+    boot.kernel.sysctl."vm.panic_on_oom" = lib.mkForce 1;
     networking.firewall.enable = false;
     users.groups.agent-workspaces = { };
     users.users.rnwst-bot = {
