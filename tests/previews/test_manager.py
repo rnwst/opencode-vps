@@ -31,6 +31,7 @@ class FakeProcess:
         self.exited = asyncio.Event()
         self.tcp = {}
         self.auto_credit = True
+        self.auto_cancel = True
         self.ignore_close = False
         self.emit(event="ready")
         self.emit(event="ports", ports=[])
@@ -50,7 +51,7 @@ class FakeProcess:
                 stream="stdout",
                 data=base64.b64encode(b"hello\x00\xff\n").decode(),
             )
-            if frame["argv"] != ["hold"]:
+            if frame["argv"][0] != "hold":
                 self.emit(
                     event="data",
                     id=request_id,
@@ -82,7 +83,7 @@ class FakeProcess:
                 )
             self.emit(event="end", id=request_id)
             self.emit(event="closed", id=request_id)
-        elif op == "cancel":
+        elif op == "cancel" and self.auto_cancel:
             self.emit(event="exit", id=request_id, code=-15)
 
     async def drain(self):
@@ -199,6 +200,12 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             ("preview_domain", "a" * 190),
             ("max_ports", 0),
             ("max_ports", True),
+            ("max_execs", 0),
+            ("max_execs", -1),
+            ("max_execs", True),
+            ("max_execs", "4"),
+            ("max_execs", 1.5),
+            ("max_execs", None),
             ("idle_timeout_seconds", 0),
             ("idle_timeout_seconds", True),
             ("idle_timeout_seconds", "300"),
@@ -206,6 +213,12 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 module.Manager({**self.config, key: value})
         self.assertEqual(self.manager.config["max_runtimes"], 4)
+        self.assertEqual(self.manager.config["max_execs"], 4)
+        for limit in (1, 2):
+            self.assertEqual(
+                module.Manager({**self.config, "max_execs": limit}).config["max_execs"],
+                limit,
+            )
         self.assertEqual(self.manager.config["max_ports"], 128)
         self.assertEqual(self.manager.config["idle_timeout_seconds"], 300)
 
@@ -281,7 +294,14 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 409)
             self.assertNotIn("ses_one", await response.text())
         runtime = self.manager.spawned[0]
-        self.assertEqual({frame["op"] for frame in runtime.process.frames}, {"exec"})
+        self.assertLessEqual(
+            {frame["op"] for frame in runtime.process.frames}, {"exec", "exec_credit"}
+        )
+        execs = [frame for frame in runtime.process.frames if frame["op"] == "exec"]
+        self.assertEqual(len(execs), 2)
+        self.assertTrue(
+            all(frame["credits"] == module.QUEUE_SIZE - 1 for frame in execs)
+        )
         self.assertEqual(
             stat.S_IMODE((self.base / "r" / "control.sock").stat().st_mode), 0o600
         )
@@ -300,13 +320,196 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
             await response.read()
 
-    async def test_concurrent_exec_refused(self):
-        first = await self.execute(argv=["hold"])
-        await first.content.readline()
-        async with await self.execute() as second:
-            self.assertEqual(second.status, 409)
-            await second.read()
-        first.close()
+    async def test_concurrent_exec_limit_default_and_overrides(self):
+        for limit in (4, 1, 2):
+            with self.subTest(limit=limit):
+                if limit != 4:
+                    self.manager.config["max_execs"] = limit
+                runtime = await self.runtime()
+                responses, ids = [], set()
+                try:
+                    async with asyncio.timeout(3):
+                        for index in range(limit):
+                            response = await self.execute(argv=["hold", str(index)])
+                            responses.append(response)
+                            self.assertEqual(response.status, 200)
+                            ids.add(json.loads(await response.content.readline())["id"])
+                        self.assertEqual(len(ids), limit)
+                        self.assertEqual(runtime.active_execs, ids)
+                        self.assertEqual(set(runtime.channels), ids)
+                        sent = [
+                            f
+                            for f in runtime.process.frames
+                            if f["op"] != "exec_credit"
+                        ]
+                        async with await self.execute() as rejected:
+                            self.assertEqual(rejected.status, 409)
+                            self.assertEqual(
+                                await rejected.text(),
+                                "session shell concurrency limit reached",
+                            )
+                        self.assertEqual(
+                            [
+                                f
+                                for f in runtime.process.frames
+                                if f["op"] != "exec_credit"
+                            ],
+                            sent,
+                        )
+                finally:
+                    for response in responses:
+                        response.close()
+                    await self.manager.stop(runtime.runtime_id)
+
+    async def test_simultaneous_admission_reserves_before_prepare_and_send(self):
+        runtime = await self.runtime()
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "directory": str(self.root),
+                "session_id": "ses_one",
+                "argv": ["hold"],
+            }
+        )
+        request.transport.is_closing.return_value = False
+        prepared, sending = [], set()
+        prepare_gate, send_gate = asyncio.Event(), asyncio.Event()
+        send = runtime.send
+
+        async def prepare(response, request):
+            prepared.append(response)
+            await prepare_gate.wait()
+
+        async def gated_send(frame):
+            if frame["op"] == "exec":
+                sending.add(frame["id"])
+                await send_gate.wait()
+            await send(frame)
+
+        with (
+            patch.object(web.StreamResponse, "prepare", prepare),
+            patch.object(web.StreamResponse, "write", new_callable=AsyncMock),
+            patch.object(runtime, "send", gated_send),
+        ):
+            tasks = [asyncio.create_task(self.manager._exec(request)) for _ in range(4)]
+            try:
+                await self.eventually(lambda: len(prepared) == 4)
+                reserved = set(runtime.channels)
+                self.assertEqual(len(reserved), 4)
+                for stage in ("prepare", "send"):
+                    with self.subTest(stage=stage):
+                        self.assertEqual(set(runtime.channels), reserved)
+                        self.assertEqual(runtime.active_execs, set())
+                        self.assertFalse(self.manager._idle(runtime))
+                        async with asyncio.timeout(2):
+                            with self.assertRaises(web.HTTPConflict) as error:
+                                await self.manager._exec(request)
+                        self.assertEqual(
+                            error.exception.text,
+                            "session shell concurrency limit reached",
+                        )
+                        self.assertEqual(runtime.process.frames, [])
+                    prepare_gate.set()
+                    await self.eventually(lambda: len(sending) == 4)
+                send_gate.set()
+                await self.eventually(lambda: runtime.active_execs == reserved)
+                for request_id in reserved:
+                    runtime.process.emit(event="exit", id=request_id, code=0)
+                await asyncio.wait_for(asyncio.gather(*tasks), 3)
+                self.assertEqual(runtime.active_execs, set())
+                self.assertFalse(runtime.channels)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_failed_response_prepare_frees_reservation(self):
+        self.manager.config["max_execs"] = 1
+        runtime = await self.runtime()
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "directory": str(self.root),
+                "session_id": "ses_one",
+                "argv": ["hold"],
+            }
+        )
+        with patch.object(
+            web.StreamResponse, "prepare", side_effect=ConnectionResetError
+        ):
+            await self.manager._exec(request)
+        self.assertFalse(runtime.channels)
+        self.assertEqual(runtime.active_execs, set())
+        self.assertFalse(any(f["op"] == "exec" for f in runtime.process.frames))
+        async with await self.execute() as response:
+            self.assertEqual(response.status, 200)
+            await response.read()
+
+    async def test_exec_credit_window_reserves_terminal_slot_without_late_acks(self):
+        runtime = await self.runtime()
+        entered, release = asyncio.Event(), asyncio.Event()
+        send = runtime.send
+
+        async def gated_send(frame):
+            await send(frame)
+            if frame["op"] == "exec":
+                entered.set()
+                await release.wait()
+
+        with patch.object(runtime, "send", gated_send):
+            response = None
+            try:
+                async with asyncio.timeout(3):
+                    response = await self.execute(argv=["hold"])
+                    self.assertEqual(response.status, 200)
+                    await entered.wait()
+                    request_id = next(iter(runtime.active_execs))
+                    grant = {
+                        "op": "exec",
+                        "id": request_id,
+                        "argv": ["hold"],
+                        "cwd": str(self.root),
+                        "credits": module.QUEUE_SIZE - 1,
+                    }
+                    self.assertEqual(runtime.process.frames, [grant])
+                    queue = runtime.channels[request_id][1]
+                    # FakeProcess already emitted the first data frame. Hold the
+                    # consumer before queue.get so even the terminal slot is used.
+                    for _ in range(grant["credits"] - 1):
+                        runtime.process.emit(
+                            event="data", id=request_id, stream="stdout", data="eA=="
+                        )
+                    runtime.process.emit(event="exit", id=request_id, code=0)
+                    await self.heartbeat(runtime, processes=0)
+                    self.assertTrue(queue.full())
+                    self.assertEqual(queue.qsize(), module.QUEUE_SIZE)
+                    self.assertIn(request_id, runtime.channels)
+                    self.assertEqual(runtime.active_execs, set())
+                    self.assertFalse(runtime.stopped)
+                    self.assertEqual(runtime.process.frames, [grant])
+                    release.set()
+                    frames = [
+                        json.loads(line)
+                        for line in (await response.read()).splitlines()
+                    ]
+                    self.assertEqual(len(frames), module.QUEUE_SIZE)
+                    self.assertTrue(
+                        all(
+                            f["event"] == "data" and f["id"] == request_id
+                            for f in frames[:-1]
+                        )
+                    )
+                    self.assertEqual(
+                        frames[-1], {"event": "exit", "id": request_id, "code": 0}
+                    )
+                    # Completion was already received, so forwarding the queued
+                    # data and terminal frame must not replenish a finished call.
+                    self.assertEqual(runtime.process.frames, [grant])
+                    self.assertFalse(runtime.channels)
+            finally:
+                release.set()
+                if response is not None:
+                    response.close()
 
     async def test_ports_tokens_and_half_close(self):
         runtime = await self.runtime()
@@ -400,9 +603,53 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         other = self.workspace("other")
         await self.heartbeat(runtime, processes=0)
         self.assertTrue(self.manager._idle(runtime))
-        async with await self.execute() as response:
-            await response.read()
-        self.assertIsNone(runtime.active_exec)
+        first = await self.execute(argv=["hold", "first"])
+        second = await self.execute(argv=["hold", "second"])
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        async with asyncio.timeout(3):
+            first_id = json.loads(await first.content.readline())["id"]
+            second_id = json.loads(await second.content.readline())["id"]
+            self.assertEqual(runtime.active_execs, {first_id, second_id})
+            runtime.process.emit(
+                event="data", id=second_id, stream="stderr", data="Yg=="
+            )
+            runtime.process.emit(
+                event="data", id=first_id, stream="stdout", data="YQ=="
+            )
+            runtime.process.emit(event="exit", id=second_id, code=7)
+            frames = [json.loads(line) for line in (await second.read()).splitlines()]
+            self.assertEqual(
+                frames,
+                [
+                    {
+                        "event": "data",
+                        "id": second_id,
+                        "stream": "stderr",
+                        "data": "Yg==",
+                    },
+                    {"event": "exit", "id": second_id, "code": 7},
+                ],
+            )
+            self.assertEqual(runtime.active_execs, {first_id})
+            await self.heartbeat(runtime, processes=0)
+            self.assertFalse(self.manager._idle(runtime))
+            self.assertIsNone(runtime.idle_since)
+            runtime.process.emit(event="exit", id=first_id, code=23)
+            frames = [json.loads(line) for line in (await first.read()).splitlines()]
+            self.assertEqual(
+                frames,
+                [
+                    {
+                        "event": "data",
+                        "id": first_id,
+                        "stream": "stdout",
+                        "data": "YQ==",
+                    },
+                    {"event": "exit", "id": first_id, "code": 23},
+                ],
+            )
+        self.assertEqual(runtime.active_execs, set())
         self.assertIsNone(runtime.idle_since)
         self.assertFalse(self.manager._idle(runtime))
         async with await self.execute(directory=str(other)) as response:
@@ -464,32 +711,58 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_exec_remains_busy_until_exit_and_new_heartbeat(self):
         self.manager.config["max_runtimes"] = 1
+        self.manager.config["max_execs"] = 2
         response = await self.execute(argv=["hold"])
-        await response.content.readline()
+        request_id = json.loads(await response.content.readline())["id"]
+        other = await self.execute(argv=["hold", "other"])
+        self.addCleanup(other.close)
+        other_id = json.loads(await other.content.readline())["id"]
         runtime = self.manager.spawned[0]
-        request_id = runtime.active_exec
+        runtime.process.auto_cancel = False
         await self.heartbeat(runtime, processes=0)
         self.assertFalse(self.manager._idle(runtime))
-        original_write = runtime.process.write
-
-        def delayed_cancel(data):
-            frame = json.loads(data)
-            if frame["op"] == "cancel":
-                runtime.process.frames.append(frame)
-            else:
-                original_write(data)
-
-        with patch.object(runtime.process, "write", delayed_cancel):
+        async with asyncio.timeout(3):
             response.close()
             await self.eventually(lambda: request_id not in runtime.channels)
             await self.heartbeat(runtime, processes=0)
-            self.assertEqual(runtime.active_exec, request_id)
+            self.assertEqual(runtime.active_execs, {request_id, other_id})
+            self.assertIn({"op": "cancel", "id": request_id}, runtime.process.frames)
             self.assertFalse(self.manager._idle(runtime))
+            sent = [f for f in runtime.process.frames if f["op"] != "exec_credit"]
+            async with await self.execute() as busy:
+                self.assertEqual(busy.status, 409)
+                self.assertEqual(
+                    await busy.text(), "session shell concurrency limit reached"
+                )
+            self.assertEqual(
+                [f for f in runtime.process.frames if f["op"] != "exec_credit"], sent
+            )
+            runtime.process.emit(
+                event="data", id=other_id, stream="stdout", data="eA=="
+            )
+            self.assertEqual(
+                json.loads(await other.content.readline()),
+                {"event": "data", "id": other_id, "stream": "stdout", "data": "eA=="},
+            )
+            runtime.process.emit(event="exit", id=request_id, code=-15)
+            await self.eventually(lambda: runtime.active_execs == {other_id})
+            replacement = await self.execute(argv=["hold", "replacement"])
+            self.addCleanup(replacement.close)
+            replacement_id = json.loads(await replacement.content.readline())["id"]
+            self.assertEqual(runtime.active_execs, {other_id, replacement_id})
             async with await self.execute() as busy:
                 self.assertEqual(busy.status, 409)
                 await busy.read()
-            runtime.process.emit(event="exit", id=request_id, code=-15)
-            await self.eventually(lambda: runtime.active_exec is None)
+            runtime.process.emit(event="exit", id=replacement_id, code=0)
+            await replacement.read()
+            runtime.process.emit(event="exit", id=other_id, code=0)
+            self.assertEqual(
+                json.loads(await other.read()),
+                {"event": "exit", "id": other_id, "code": 0},
+            )
+            self.assertEqual(runtime.active_execs, set())
+            self.assertFalse(runtime.stopped)
+            self.assertFalse(self.manager.killed)
             self.assertFalse(self.manager._idle(runtime))
             await self.heartbeat(runtime, processes=0)
             self.assertTrue(self.manager._idle(runtime))
@@ -552,6 +825,11 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_hook_idempotent_and_session_scoped(self):
         runtime = await self.runtime()
+        responses = [await self.execute(argv=["hold", str(i)]) for i in range(2)]
+        for response in responses:
+            self.addCleanup(response.close)
+            await response.content.readline()
+        self.assertEqual(len(runtime.active_execs), 2)
         for session in ("ses_other", "ses_one", "ses_one"):
             async with self.http.post(
                 "http://localhost/stop",
@@ -565,6 +843,17 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             if session == "ses_other":
                 self.assertIn(runtime.runtime_id, self.manager.runtimes)
         self.assertEqual(self.manager.killed, [runtime.runtime_id])
+        async with asyncio.timeout(3):
+            for response in responses:
+                self.assertEqual(
+                    json.loads(await response.read()),
+                    {"event": "error", "error": "runtime execution failed"},
+                )
+        self.assertFalse(runtime.channels)
+        self.assertFalse(runtime.connections)
+        self.assertTrue(runtime.reader_task.done())
+        self.assertIsNotNone(runtime.process.returncode)
+        self.assertNotIn(runtime.runtime_id, self.manager.runtimes)
 
     async def test_inode_and_temporary_deletion_watch(self):
         runtime = await self.runtime()
@@ -590,23 +879,129 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_queue_overflow_closes_only_affected_channel(self):
         runtime = await self.runtime()
+        runtime.process.auto_cancel = False
         for kind, operation in (("tcp", "close"), ("exec", "cancel")):
             request_id, queue = runtime.channel(kind)
-            healthy, healthy_queue = runtime.channel("tcp")
-            for _ in range(module.QUEUE_SIZE + 1):
-                runtime.process.emit(
-                    event="data", id=request_id, stream="stdout", data="eA=="
+            if kind == "exec":
+                await runtime.send(
+                    {
+                        "op": "exec",
+                        "id": request_id,
+                        "argv": ["hold"],
+                        "cwd": str(self.root),
+                        "credits": module.QUEUE_SIZE - 1,
+                    }
                 )
-            runtime.process.emit(event="data", id=healthy, data="eQ==")
-            frame = await asyncio.wait_for(healthy_queue.get(), 2)
-            self.assertEqual(base64.b64decode(frame["data"]), b"y")
-            self.assertNotIn(request_id, runtime.channels)
-            self.assertEqual(
-                queue.get_nowait()["error"], "stream output limit exceeded"
-            )
-            self.assertIn({"op": operation, "id": request_id}, runtime.process.frames)
-            self.assertFalse(runtime.stopped)
-            runtime.channels.pop(healthy)
+            healthy = await self.execute(argv=["hold", "healthy"])
+            self.addCleanup(healthy.close)
+            healthy_id = json.loads(await healthy.content.readline())["id"]
+            tcp_id, tcp_queue = runtime.channel("tcp")
+            mcp_id, mcp_queue = runtime.channel("mcp")
+            await runtime.send({"op": "mcp", "id": mcp_id, "request": {}})
+            async with asyncio.timeout(3):
+                for _ in range(module.QUEUE_SIZE + 1):
+                    runtime.process.emit(
+                        event="data", id=request_id, stream="stdout", data="eA=="
+                    )
+                runtime.process.emit(
+                    event="data", id=healthy_id, stream="stdout", data="eQ=="
+                )
+                runtime.process.emit(event="data", id=tcp_id, data="eg==")
+                runtime.process.emit(event="mcp_data", id=mcp_id, data="e30=")
+                await self.heartbeat(runtime, processes=0)
+                self.assertEqual(
+                    json.loads(await healthy.content.readline()),
+                    {
+                        "event": "data",
+                        "id": healthy_id,
+                        "stream": "stdout",
+                        "data": "eQ==",
+                    },
+                )
+                self.assertEqual(
+                    await tcp_queue.get(),
+                    {"event": "data", "id": tcp_id, "data": "eg=="},
+                )
+                self.assertEqual(
+                    await mcp_queue.get(),
+                    {"event": "mcp_data", "id": mcp_id, "data": "e30="},
+                )
+                self.assertEqual(
+                    runtime.active_execs,
+                    {healthy_id, request_id} if kind == "exec" else {healthy_id},
+                )
+                self.assertEqual(runtime.active_mcp, mcp_id)
+                self.assertNotIn(request_id, runtime.channels)
+                self.assertEqual(
+                    queue.get_nowait()["error"], "stream output limit exceeded"
+                )
+                self.assertTrue(queue.empty())
+                self.assertIn(
+                    {"op": operation, "id": request_id}, runtime.process.frames
+                )
+                self.assertFalse(runtime.stopped)
+                if kind == "exec":
+                    runtime.process.emit(event="exit", id=request_id, code=-15)
+                runtime.process.emit(event="exit", id=healthy_id, code=0)
+                self.assertEqual(
+                    json.loads(await healthy.read()),
+                    {"event": "exit", "id": healthy_id, "code": 0},
+                )
+                runtime.process.emit(event="mcp_end", id=mcp_id)
+                self.assertEqual((await mcp_queue.get())["event"], "mcp_end")
+            runtime.channels.pop(tcp_id)
+            runtime.channels.pop(mcp_id)
+
+    async def test_invalid_response_kind_on_active_exec_fails_closed_after_disconnect(
+        self,
+    ):
+        for disconnected in (False, True):
+            for frame in (
+                {"event": "connected"},
+                {"event": "written", "size": 1},
+                {"event": "closed"},
+                {"event": "mcp_end"},
+                {"event": "data", "stream": "invalid", "data": "eA=="},
+            ):
+                with self.subTest(disconnected=disconnected, frame=frame):
+                    runtime = await self.runtime()
+                    runtime.process.auto_cancel = False
+                    first = await self.execute(argv=["hold", "first"])
+                    second = await self.execute(argv=["hold", "second"])
+                    self.addCleanup(first.close)
+                    self.addCleanup(second.close)
+                    async with asyncio.timeout(3):
+                        first_id = json.loads(await first.content.readline())["id"]
+                        second_id = json.loads(await second.content.readline())["id"]
+                        if disconnected:
+                            first.close()
+                            await self.eventually(
+                                lambda runtime=runtime, first_id=first_id: (
+                                    first_id not in runtime.channels
+                                )
+                            )
+                        active_at_stop = []
+                        stop = self.manager._background_stop
+
+                        def track_stop(
+                            runtime_id,
+                            runtime=runtime,
+                            active_at_stop=active_at_stop,
+                            stop=stop,
+                        ):
+                            active_at_stop.append(set(runtime.active_execs))
+                            return stop(runtime_id)
+
+                        with patch.object(self.manager, "_background_stop", track_stop):
+                            runtime.process.emit(id=first_id, **frame)
+                            await self.eventually(
+                                lambda runtime=runtime: (
+                                    runtime.runtime_id not in self.manager.runtimes
+                                )
+                            )
+                        self.assertEqual(active_at_stop, [{first_id, second_id}])
+                        self.assertTrue(runtime.stopped)
+                        self.assertIn(runtime.runtime_id, self.manager.killed)
 
     async def test_port_cap_counts_disappeared_mappings(self):
         self.manager.config["max_ports"] = 2
@@ -815,7 +1210,29 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 clear=True,
             ),
         ):
-            await module.Manager._spawn(self.manager, runtime)
+            for limit in (4, 1, 2):
+                with self.subTest(limit=limit):
+                    self.manager.config["max_execs"] = limit
+                    await module.Manager._spawn(self.manager, runtime)
+                    self.assertEqual(
+                        spawn.call_args.args,
+                        (
+                            sys.executable,
+                            "-I",
+                            "-S",
+                            self.config["launch"],
+                            "--cgroup",
+                            "/fake/cgroup",
+                            "--sandbox-exec",
+                            self.config["sandbox_exec"],
+                            "--python",
+                            sys.executable,
+                            "--supervisor",
+                            self.config["supervisor"],
+                            "--max-execs",
+                            str(limit),
+                        ),
+                    )
         environment = spawn.call_args.kwargs["env"]
         self.assertEqual(
             environment,
@@ -885,8 +1302,10 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         script = (
             "import runpy,sys; ns=runpy.run_path(sys.argv[1]); "
             "worker=ns['Supervisor']; "
-            "worker.run.__globals__['listening_ports']=lambda: [int(sys.argv[2])]; worker().run()"
+            "worker.run.__globals__['listening_ports']=lambda: [int(sys.argv[2])]; "
+            "worker(max_execs=int(sys.argv[3])).run()"
         )
+        self.manager.config["max_execs"] = 2
 
         async def consume(reader, writer):
             total = 0
@@ -912,6 +1331,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 script,
                 str(SOURCE / "supervisor.py"),
                 str(port),
+                str(self.manager.config["max_execs"]),
                 cwd=runtime.directory,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -942,28 +1362,44 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                             base64.b64decode(frames[0]["data"]), b"foreground"
                         )
                 async with asyncio.timeout(10):
-                    async with await self.execute(
-                        argv=[
-                            sys.executable,
-                            "-I",
-                            "-S",
-                            "-c",
-                            "import sys; sys.stdout.buffer.write(b'x' * 2097152)",
-                        ]
-                    ) as response:
-                        frames = [
-                            json.loads(line)
-                            for line in (await response.read()).splitlines()
-                        ]
+                    responses = await asyncio.gather(
+                        *(
+                            self.execute(
+                                argv=[
+                                    sys.executable,
+                                    "-I",
+                                    "-S",
+                                    "-c",
+                                    f"import sys; sys.stdout.buffer.write({byte!r} * 2097152)",
+                                ]
+                            )
+                            for byte in (b"x", b"y")
+                        )
+                    )
+                    for response in responses:
+                        self.addCleanup(response.close)
+                        self.assertEqual(response.status, 200)
+                    bodies = await asyncio.gather(
+                        *(response.read() for response in responses)
+                    )
+                    ids = set()
+                    for body, byte in zip(bodies, (b"x", b"y")):
+                        frames = [json.loads(line) for line in body.splitlines()]
                         self.assertEqual(frames[-1]["code"], 0)
+                        request_id = frames[-1]["id"]
+                        ids.add(request_id)
+                        self.assertTrue(
+                            all(frame["id"] == request_id for frame in frames)
+                        )
                         self.assertEqual(
-                            sum(
-                                len(base64.b64decode(f["data"]))
+                            b"".join(
+                                base64.b64decode(f["data"])
                                 for f in frames
                                 if f["event"] == "data"
                             ),
-                            2097152,
+                            byte * 2097152,
                         )
+                    self.assertEqual(len(ids), 2)
                 self.assertEqual(len(self.manager.runtimes), 1)
                 await self.eventually(lambda: bool(self.manager.list_previews()))
                 runtime = next(iter(self.manager.runtimes.values()))
@@ -1049,7 +1485,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             group / "cpu.weight",
         ):
 
-            def write(path, value):
+            def write(path, value, failed=failed):
                 if path == failed:
                     raise OSError("cgroup setup failed")
 
@@ -1110,30 +1546,37 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             "--supervisor",
             "/fixed/supervisor.py",
         ]
-        with (
-            patch.object(sys, "argv", argv),
-            patch.object(launch, "delegated_root", return_value=root),
-            patch.object(Path, "resolve", return_value=group),
-            patch.object(Path, "is_symlink", return_value=False),
-            patch.object(Path, "write_text", write),
-            patch.object(launch.os, "execv", execute),
-            self.assertRaises(SystemExit),
-        ):
-            launch.main()
-        self.assertEqual(
-            steps,
-            [
-                ("cgroup.procs", str(os.getpid())),
-                (
-                    "/fixed/sandbox",
-                    [
-                        "/fixed/sandbox",
-                        "-c",
-                        "exec /fixed/python -I -S /fixed/supervisor.py",
-                    ],
+        for limit in (None, 1, 2):
+            steps.clear()
+            with (
+                self.subTest(limit=limit),
+                patch.object(
+                    sys,
+                    "argv",
+                    argv + ([] if limit is None else ["--max-execs", str(limit)]),
                 ),
-            ],
-        )
+                patch.object(launch, "delegated_root", return_value=root),
+                patch.object(Path, "resolve", return_value=group),
+                patch.object(Path, "is_symlink", return_value=False),
+                patch.object(Path, "write_text", write),
+                patch.object(launch.os, "execv", execute),
+                self.assertRaises(SystemExit),
+            ):
+                launch.main()
+            self.assertEqual(
+                steps,
+                [
+                    ("cgroup.procs", str(os.getpid())),
+                    (
+                        "/fixed/sandbox",
+                        [
+                            "/fixed/sandbox",
+                            "-c",
+                            f"exec /fixed/python -I -S /fixed/supervisor.py --max-execs {4 if limit is None else limit}",
+                        ],
+                    ),
+                ],
+            )
 
     def test_launch_rejects_cgroups_outside_pool_and_aliases(self):
         root = Path("/sys/fs/cgroup/service")

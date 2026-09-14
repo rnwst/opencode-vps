@@ -11,6 +11,7 @@ assert lib.assertMsg (
   gatewayPort = 4080;
   runtimeRoot = "/run/opencode-previews";
   maxRuntimes = 4;
+  maxExecs = 4;
   maxPorts = 128;
   maxConnections = 128;
   memoryMax = 9663676416;

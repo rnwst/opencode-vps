@@ -31,6 +31,7 @@ from mcp_transport import MCPChild
 
 MAX_FRAME = 256 * 1024
 MAX_COMMAND = 128 * 1024
+MAX_EXEC_CREDITS = 128
 CHUNK = 16 * 1024
 MAX_STREAMS = 128
 MAX_PENDING = 256 * 1024
@@ -118,7 +119,14 @@ def workload_processes():
 class Command:
     id: str
     process: subprocess.Popen
+    credits: int
+    window: int = field(init=False)
     finished: bool = False
+    discard: bool = False
+    exitcode: int | None = None
+
+    def __post_init__(self):
+        self.window = self.credits
 
 
 @dataclass(eq=False)
@@ -126,6 +134,7 @@ class Pipe:
     file: object
     command: Command
     stream: str
+    remaining: int | None = None
 
 
 @dataclass(eq=False)
@@ -143,7 +152,10 @@ class Stream:
 
 
 class Supervisor:
-    def __init__(self, playwright_mcp=None):
+    def __init__(self, playwright_mcp=None, max_execs=4):
+        if type(max_execs) is not int or max_execs <= 0:
+            raise ValueError("max_execs must be a positive integer")
+        self.max_execs = max_execs
         self.workspace = Path.cwd().resolve()
         self.environment = dict(os.environ)
         self.selector = selectors.DefaultSelector()
@@ -153,7 +165,7 @@ class Supervisor:
         self.written = 0
         self.streams = {}
         self.pipes = set()
-        self.command = None
+        self.commands = collections.OrderedDict()
         self.kills = {}
         self.running = True
         self.mcp = MCPChild(self, playwright_mcp)
@@ -233,7 +245,8 @@ class Supervisor:
             id = candidate
             op = request.get("op")
             schemas = {
-                "exec": {"op", "id", "argv", "cwd"},
+                "exec": {"op", "id", "argv", "cwd", "credits"},
+                "exec_credit": {"op", "id", "credits"},
                 "cancel": {"op", "id"},
                 "connect": {"op", "id", "port"},
                 "data": {"op", "id", "data"},
@@ -248,14 +261,14 @@ class Supervisor:
                 or set(request) != schemas[op]
             ):
                 raise ValueError
+            if op in ("exec", "exec_credit"):
+                credits = request["credits"]
+                if type(credits) is not int or not 1 <= credits <= MAX_EXEC_CREDITS:
+                    raise ValueError
             if op == "mcp":
                 if len(line) > MAX_COMMAND:
                     raise ValueError
-                if (
-                    id in self.streams
-                    or id in self.kills
-                    or (self.command and self.command.id == id)
-                ):
+                if id in self.streams or id in self.kills or id in self.commands:
                     self.error(id, "id in use")
                 else:
                     self.mcp.call(id, request["request"])
@@ -278,7 +291,8 @@ class Supervisor:
                     self.error(id, "cwd is outside workspace or not a directory")
                     return
                 if (
-                    self.command is not None
+                    len(self.commands) >= self.max_execs
+                    or id in self.commands
                     or id in self.streams
                     or id in self.kills
                     or id == self.mcp.id
@@ -298,17 +312,28 @@ class Supervisor:
                     stderr=subprocess.PIPE,
                     start_new_session=True,
                 )
-                self.command = Command(id, process)
+                command = Command(id, process, credits)
+                self.commands[id] = command
                 for name in ("stdout", "stderr"):
                     file = getattr(process, name)
                     os.set_blocking(file.fileno(), False)
-                    self.pipes.add(Pipe(file, self.command, name))
+                    self.pipes.add(Pipe(file, command, name))
+            elif op == "exec_credit":
+                # The last data ACK can arrive after the reserved exit frame.
+                command = self.commands.get(id)
+                if command is not None:
+                    if command.credits + credits > command.window:
+                        raise ValueError
+                    command.credits += credits
             elif op == "cancel":
-                if self.command is None or self.command.id != id:
+                if id not in self.commands:
                     self.error(id, "unknown exec")
                 elif id not in self.kills:
-                    self.signal_group(self.command.process.pid, signal.SIGTERM)
-                    self.kills[id] = (self.command.process.pid, time.monotonic() + 2)
+                    # A disconnected consumer cannot return its outstanding ACKs.
+                    self.commands[id].discard = True
+                    pid = self.commands[id].process.pid
+                    self.signal_group(pid, signal.SIGTERM)
+                    self.kills[id] = (pid, time.monotonic() + 2)
             elif op == "connect":
                 port = request["port"]
                 if (
@@ -319,7 +344,7 @@ class Supervisor:
                     raise ValueError
                 if (
                     id in self.streams
-                    or (self.command and self.command.id == id)
+                    or id in self.commands
                     or id in self.kills
                     or id == self.mcp.id
                 ):
@@ -370,44 +395,68 @@ class Supervisor:
         self.pipes.discard(pipe)
 
     def read_pipe(self, pipe, size=CHUNK):
+        discard = pipe.command.finished or pipe.command.discard
+        # Readiness may predate another pipe consuming this command's last credit
+        # or other callbacks filling the shared output buffer.
+        if not discard and (
+            not pipe.command.credits or self.output_size >= OUTPUT_HIGH
+        ):
+            return 0
+        if not pipe.command.finished and pipe.remaining is not None:
+            size = min(size, pipe.remaining)
+            if not size:
+                return 0
         try:
             data = os.read(pipe.file.fileno(), min(size, CHUNK))
         except BlockingIOError:
             return 0
         if not data:
+            pipe.remaining = 0
             self.close_pipe(pipe)
         elif not pipe.command.finished:
-            self.emit(
-                "data",
-                pipe.command.id,
-                stream=pipe.stream,
-                data=base64.b64encode(data).decode("ascii"),
-            )
+            if not discard:
+                self.emit(
+                    "data",
+                    pipe.command.id,
+                    stream=pipe.stream,
+                    data=base64.b64encode(data).decode("ascii"),
+                )
+                pipe.command.credits -= 1
+            if pipe.remaining is not None:
+                pipe.remaining -= len(data)
         return len(data)
 
-    def poll_command(self):
-        if self.command is None:
-            return
-        command = self.command
-        code = command.process.poll()
-        if code is None:
-            return
-        # Snapshot queued bytes: descendants may keep writing indefinitely. Do not
-        # wait for EOF or chase new writes after the foreground process exits.
-        for pipe in list(self.pipes):
-            if pipe.command is not command:
+    def poll_commands(self):
+        for command in self.commands.values():
+            if command.exitcode is not None:
                 continue
-            queued = array.array("i", [0])
-            fcntl.ioctl(pipe.file.fileno(), termios.FIONREAD, queued, True)
-            remaining = min(queued[0], 1024 * 1024)
-            while remaining:
-                count = self.read_pipe(pipe, remaining)
-                if not count:
-                    break
-                remaining -= count
-        command.finished = True
-        self.command = None
-        self.emit("exit", command.id, code=code)
+            command.exitcode = command.process.poll()
+            if command.exitcode is not None:
+                # Snapshot once, even under backpressure: descendants may keep
+                # writing forever, so neither wait for EOF nor chase new bytes.
+                for pipe in self.pipes:
+                    if pipe.command is command:
+                        queued = array.array("i", [0])
+                        fcntl.ioctl(pipe.file.fileno(), termios.FIONREAD, queued, True)
+                        pipe.remaining = queued[0]
+
+        # Bound work per refresh, and rotate so simultaneous exits share progress
+        # even when only one command fits below the output high-water mark.
+        budget = 2 * CHUNK
+        for id, command in list(self.commands.items()):
+            self.commands.move_to_end(id)
+            if command.exitcode is None:
+                continue
+            pipes = [pipe for pipe in self.pipes if pipe.command is command]
+            for pipe in pipes:
+                if pipe.remaining and budget:
+                    budget -= self.read_pipe(pipe, budget)
+            if not any(pipe.remaining for pipe in pipes) and id not in self.kills:
+                self.emit("exit", id, code=command.exitcode)
+                command.finished = True
+                del self.commands[id]
+            if not budget or self.output_size >= OUTPUT_HIGH:
+                break
 
     def dial(self, stream):
         try:
@@ -454,7 +503,7 @@ class Supervisor:
                     stream.connecting = False
                     self.emit("connected", stream.id)
                 return
-            if events & selectors.EVENT_READ:
+            if events & selectors.EVENT_READ and self.output_size < OUTPUT_HIGH:
                 data = stream.sock.recv(CHUNK)
                 if data:
                     self.emit(
@@ -475,16 +524,23 @@ class Supervisor:
 
     def refresh(self):
         now = time.monotonic()
-        self.poll_command()
-        self.mcp.refresh(self.output_size < OUTPUT_HIGH)
         for id, (pid, deadline) in list(self.kills.items()):
             if now >= deadline:
                 self.signal_group(pid, signal.SIGKILL)
                 del self.kills[id]
+        self.poll_commands()
+        self.mcp.refresh(self.output_size < OUTPUT_HIGH)
         for pipe in self.pipes:
             events = (
                 selectors.EVENT_READ
-                if pipe.command.finished or self.output_size < OUTPUT_HIGH
+                if pipe.command.finished
+                or (
+                    pipe.remaining is None
+                    and (
+                        pipe.command.discard
+                        or (pipe.command.credits and self.output_size < OUTPUT_HIGH)
+                    )
+                )
                 else 0
             )
             self.watch(pipe.file, events, ("pipe", pipe))
@@ -549,14 +605,15 @@ class Supervisor:
         finally:
             groups = {pipe.command.process.pid for pipe in self.pipes}
             groups.update(pid for pid, _ in self.kills.values())
-            if self.command:
-                groups.add(self.command.process.pid)
+            groups.update(command.process.pid for command in self.commands.values())
             for pid in groups:
                 self.signal_group(pid, signal.SIGKILL)
             for pipe in list(self.pipes):
                 self.close_pipe(pipe)
-            if self.command:
-                self.command.process.wait(timeout=3)
+            for command in self.commands.values():
+                command.process.wait(timeout=3)
+            self.commands.clear()
+            self.kills.clear()
             for stream in self.streams.values():
                 if stream.sock is not None:
                     stream.sock.close()
@@ -569,12 +626,15 @@ def main():
         secure_process()
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--playwright-mcp")
+        parser.add_argument("--max-execs", type=int, default=4)
         args = parser.parse_args()
+        if args.max_execs <= 0:
+            parser.error("--max-execs must be a positive integer")
         if args.playwright_mcp is not None and (
             not os.path.isabs(args.playwright_mcp) or "\0" in args.playwright_mcp
         ):
             parser.error("MCP launcher must be an absolute trusted path")
-        Supervisor(args.playwright_mcp).run()
+        Supervisor(args.playwright_mcp, max_execs=args.max_execs).run()
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
         print(
             "sandbox supervisor stopped: security or control failure", file=sys.stderr

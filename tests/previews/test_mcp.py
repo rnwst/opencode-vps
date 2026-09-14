@@ -51,6 +51,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         )
         launcher.chmod(0o700)
         self.manager.config["playwright_mcp"] = str(launcher)
+        self.manager.config["max_execs"] = 2
         # Only tests bypass native security attestation and host port discovery.
         script = """
 import os, runpy, sys
@@ -66,7 +67,7 @@ mcp_transport.MCP_STOP_TIMEOUT = 0.4
 # Explicitly emulate the production session_tmp -> /tmp bind mount.
 mcp_transport.MCP_TMP = Path(sys.argv[3])
 try:
-    ns['Supervisor'](sys.argv[2]).run()
+    ns['Supervisor'](sys.argv[2], max_execs=int(sys.argv[4])).run()
 except RuntimeError:
     sys.exit(70)
 """
@@ -82,6 +83,7 @@ except RuntimeError:
                 str(SOURCE / "supervisor.py"),
                 str(launcher),
                 str(runtime.session_tmp),
+                str(self.manager.config["max_execs"]),
                 cwd=runtime.directory,
                 env={
                     "PATH": os.defpath,
@@ -134,6 +136,25 @@ except RuntimeError:
         task = asyncio.create_task(self.call("hang"))
         await self.eventually(lambda: (self.root / "hanging").exists())
         return task, int((self.root / "hanging").read_text())
+
+    async def shells(self):
+        responses = {}
+        async with asyncio.timeout(3):
+            for _ in range(2):
+                response = await self.execute(
+                    argv=[
+                        sys.executable,
+                        "-c",
+                        "import time; print('ready',flush=True); time.sleep(60)",
+                    ]
+                )
+                self.addCleanup(response.close)
+                self.assertEqual(response.status, 200)
+                frame = json.loads(await response.content.readline())
+                responses[frame["id"]] = response
+        self.assertEqual(len(responses), 2)
+        self.assertEqual((await self.runtime()).active_execs, set(responses))
+        return responses
 
     @staticmethod
     def alive(pid):
@@ -217,25 +238,146 @@ except RuntimeError:
         self.assertTrue(all(0 < size <= 16384 for size in chunks))
         self.assertFalse(runtime.stopped)
 
-    async def test_shell_slot_independent_and_mcp_busy(self):
-        shell = await self.execute(
-            argv=[
-                sys.executable,
-                "-c",
-                "import time; print('ready',flush=True); time.sleep(60)",
-            ]
-        )
-        await shell.content.readline()
+    async def test_credit_starved_shell_preserves_output_and_other_calls_progress(self):
         runtime = await self.runtime()
-        shell_id = runtime.active_exec
+        entered, release = asyncio.Event(), asyncio.Event()
+        send, write = runtime.send, web.StreamResponse.write
+        sent, credit_writes = [], []
+        slow_id = None
+        forwarded = 0
+
+        async def track_send(frame):
+            nonlocal slow_id
+            if frame["op"] == "exec" and slow_id is None:
+                slow_id = frame["id"]
+            sent.append(frame)
+            if frame["op"] == "exec_credit" and frame["id"] == slow_id:
+                credit_writes.append(forwarded)
+            await send(frame)
+
+        async def gated_write(response, data):
+            nonlocal forwarded
+            frame = json.loads(data)
+            if frame.get("id") == slow_id and frame["event"] == "data":
+                entered.set()
+                await release.wait()
+                await write(response, data)
+                forwarded += 1
+            else:
+                await write(response, data)
+
+        with (
+            patch.object(runtime, "send", track_send),
+            patch.object(web.StreamResponse, "write", gated_write),
+        ):
+            stalled = None
+            try:
+                async with asyncio.timeout(10):
+                    stalled = await self.execute(
+                        argv=[
+                            sys.executable,
+                            "-I",
+                            "-S",
+                            "-c",
+                            "import sys; sys.stdout.buffer.write(bytes(range(256)) * 8192)",
+                        ]
+                    )
+                    self.assertEqual(stalled.status, 200)
+                    await entered.wait()
+                    grant = sent[0]
+                    self.assertEqual(grant["credits"], module.QUEUE_SIZE - 1)
+                    queue = runtime.channels[slow_id][1]
+                    # One frame is held in response.write and the remaining
+                    # granted frames are queued, exhausting this command's credit.
+                    await self.eventually(lambda: queue.qsize() == grant["credits"] - 1)
+                    heartbeat = runtime.last_heartbeat
+                    async with await self.execute(
+                        argv=[
+                            sys.executable,
+                            "-I",
+                            "-S",
+                            "-c",
+                            "import sys; sys.stdout.buffer.write(b'y' * 2097152)",
+                        ]
+                    ) as healthy:
+                        self.assertEqual(healthy.status, 200)
+                        frames = [
+                            json.loads(line)
+                            for line in (await healthy.read()).splitlines()
+                        ]
+                    self.assertEqual(frames[-1]["event"], "exit")
+                    self.assertEqual(frames[-1]["code"], 0)
+                    self.assertNotEqual(frames[-1]["id"], slow_id)
+                    self.assertEqual(
+                        b"".join(base64.b64decode(f["data"]) for f in frames[:-1]),
+                        b"y" * 2097152,
+                    )
+                    self.assertEqual((await self.result())["count"], 1)
+                    await self.eventually(lambda: runtime.last_heartbeat > heartbeat)
+                    self.assertEqual(runtime.active_execs, {slow_id})
+                    self.assertIs(runtime.channels[slow_id][1], queue)
+                    self.assertEqual(queue.qsize(), grant["credits"] - 1)
+                    self.assertFalse(runtime.stopped)
+                    self.assertEqual(forwarded, 0)
+                    self.assertEqual(credit_writes, [])
+                    self.assertEqual([f for f in sent if f["id"] == slow_id], [grant])
+
+                    release.set()
+                    frames = [
+                        json.loads(line) for line in (await stalled.read()).splitlines()
+                    ]
+                    self.assertEqual(
+                        frames[-1], {"event": "exit", "id": slow_id, "code": 0}
+                    )
+                    self.assertTrue(
+                        all(
+                            f["event"] == "data" and f["id"] == slow_id
+                            for f in frames[:-1]
+                        )
+                    )
+                    self.assertEqual(
+                        b"".join(base64.b64decode(f["data"]) for f in frames[:-1]),
+                        bytes(range(256)) * 8192,
+                    )
+                    self.assertEqual(forwarded, len(frames) - 1)
+                    self.assertTrue(credit_writes)
+                    self.assertEqual(
+                        credit_writes, list(range(1, len(credit_writes) + 1))
+                    )
+                    credits = [
+                        f
+                        for f in sent
+                        if f["id"] == slow_id and f["op"] == "exec_credit"
+                    ]
+                    self.assertTrue(all(f["credits"] == 1 for f in credits))
+                    self.assertFalse(any(f["op"] == "cancel" for f in sent))
+                    self.assertEqual(runtime.active_execs, set())
+                    self.assertFalse(runtime.channels)
+                    self.assertFalse(runtime.stopped)
+            finally:
+                release.set()
+                if stalled is not None:
+                    stalled.close()
+
+    async def test_shell_slots_independent_and_mcp_busy(self):
+        shells = await self.shells()
+        runtime = await self.runtime()
+        shell_ids = set(shells)
         await self.result()
         pending, pid = await self.hanging()
         try:
             async with await self.call() as response:
                 self.assertEqual(response.status, 409)
-            self.assertEqual(runtime.active_exec, shell_id)
-            shell.close()
-            await self.eventually(lambda: runtime.active_exec is None)
+            self.assertEqual(runtime.active_execs, shell_ids)
+            async with await self.execute() as response:
+                self.assertEqual(response.status, 409)
+                self.assertEqual(
+                    await response.text(), "session shell concurrency limit reached"
+                )
+            cancelled_id = next(iter(shells))
+            shells[cancelled_id].close()
+            remaining = shell_ids - {cancelled_id}
+            await self.eventually(lambda: runtime.active_execs == remaining)
             self.assertTrue(self.alive(pid))
             async with await self.execute(
                 argv=[sys.executable, "-c", "print('independent')"]
@@ -245,27 +387,20 @@ except RuntimeError:
                 ]
                 self.assertEqual(frames[-1]["code"], 0)
                 self.assertEqual(base64.b64decode(frames[0]["data"]), b"independent\n")
+            self.assertEqual(runtime.active_execs, remaining)
         finally:
             pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
-            shell.close()
         await self.eventually(lambda: not self.alive(pid))
         await self.eventually(lambda: runtime.active_mcp is None)
         self.assertFalse(runtime.stopped)
+        self.assertEqual(runtime.active_execs, remaining)
         self.assertEqual((await self.result())["count"], 1)
 
     async def test_timeout_resets_browser_not_shell_runtime(self):
-        shell = await self.execute(
-            argv=[
-                sys.executable,
-                "-c",
-                "import time; print('ready',flush=True); time.sleep(60)",
-            ]
-        )
-        self.addCleanup(shell.close)
-        await shell.content.readline()
+        shells = await self.shells()
         runtime = await self.runtime()
-        shell_id = runtime.active_exec
+        shell_ids = set(shells)
         with patch.object(module, "MCP_TIMEOUT", 0.3):
             pending, pid = await self.hanging()
             async with await pending as response:
@@ -276,7 +411,7 @@ except RuntimeError:
         await self.eventually(lambda: not self.alive(pid))
         await self.eventually(lambda: runtime.active_mcp is None)
         self.assertFalse(runtime.stopped)
-        self.assertEqual(runtime.active_exec, shell_id)
+        self.assertEqual(runtime.active_execs, shell_ids)
         self.assertEqual((await self.result())["count"], 1)
 
     async def test_child_failures_only_reset_browser(self):
@@ -327,12 +462,21 @@ except RuntimeError:
         await self.eventually(lambda: not list(homes.iterdir()))
 
     async def test_stop_reaps_child_and_fails_pending(self):
+        shells = await self.shells()
         first = await self.result()
         pending, pid = await self.hanging()
         runtime = await self.runtime()
         await self.manager.stop(runtime.runtime_id)
         async with await pending as response:
             self.assertEqual(response.status, 502)
+        async with asyncio.timeout(3):
+            for shell in shells.values():
+                self.assertEqual(
+                    json.loads(await shell.read()),
+                    {"event": "error", "error": "runtime execution failed"},
+                )
+        self.assertFalse(runtime.channels)
+        self.assertTrue(runtime.reader_task.done())
         self.assertFalse(self.alive(pid))
         self.assertNotIn(runtime.runtime_id, self.manager.runtimes)
         self.assertFalse(Path(first["home"]).parent.exists())
@@ -653,8 +797,13 @@ except RuntimeError:
         ):
             await module.Manager._spawn(self.manager, runtime)
         self.assertEqual(
-            spawn.call_args.args[-2:],
-            ("--playwright-mcp", self.manager.config["playwright_mcp"]),
+            spawn.call_args.args[-4:],
+            (
+                "--max-execs",
+                "2",
+                "--playwright-mcp",
+                self.manager.config["playwright_mcp"],
+            ),
         )
 
 
@@ -864,6 +1013,8 @@ class MCPUnitTests(unittest.TestCase):
                 "-I",
                 "-S",
                 "/fixed/supervisor.py",
+                "--max-execs",
+                "4",
                 "--playwright-mcp",
                 executable,
             ],

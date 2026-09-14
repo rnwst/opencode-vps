@@ -25,8 +25,11 @@ def main():
     parser.add_argument("--sandbox-exec", required=True)
     parser.add_argument("--python", required=True)
     parser.add_argument("--supervisor", required=True)
+    parser.add_argument("--max-execs", type=int, default=4)
     parser.add_argument("--playwright-mcp")
     args = parser.parse_args()
+    if args.max_execs <= 0:
+        parser.error("max-execs must be a positive integer")
     group = Path(args.cgroup)
     root = delegated_root()
     if (
@@ -43,7 +46,14 @@ def main():
         if not os.path.isabs(value) or "\0" in value:
             parser.error("launch executables must be absolute trusted paths")
     (group / "cgroup.procs").write_text(str(os.getpid()))
-    argv = [args.python, "-I", "-S", args.supervisor]
+    argv = [
+        args.python,
+        "-I",
+        "-S",
+        args.supervisor,
+        "--max-execs",
+        str(args.max_execs),
+    ]
     if args.playwright_mcp is not None:
         argv.extend(["--playwright-mcp", args.playwright_mcp])
     command = "exec " + shlex.join(argv)

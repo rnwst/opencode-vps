@@ -80,7 +80,7 @@ class Runtime:
         self.last_ports = self.created
         self.last_heartbeat = 0
         self.last_exec_activity = self.created
-        self.active_exec = None
+        self.active_execs = set()
         self.active_mcp = None
         self.processes = None
         self.reported_ports = set()
@@ -100,12 +100,16 @@ class Runtime:
         self.stop_reason = "runtime stopped"
 
     async def send(self, frame):
-        if self.stopped or self.process is None or self.process.returncode is not None:
-            raise ConnectionError("runtime is unavailable")
         data = frame_bytes(frame)
         async with self.write_lock:
+            if (
+                self.stopped
+                or self.process is None
+                or self.process.returncode is not None
+            ):
+                raise ConnectionError("runtime is unavailable")
             if frame["op"] == "exec":
-                self.active_exec = frame["id"]
+                self.active_execs.add(frame["id"])
             elif frame["op"] == "mcp":
                 self.active_mcp = frame["id"]
             if frame["op"] in {"exec", "mcp"}:
@@ -194,38 +198,46 @@ class Runtime:
                         or not 1 <= frame["size"] <= 16384
                     ):
                         raise ValueError("invalid write acknowledgment")
-                    # Keep tracking a cancelled exec after its HTTP channel has
-                    # disappeared; only supervisor completion clears it.
-                    if kind in {"exit", "error"} and request_id == self.active_exec:
-                        self.active_exec = None
+                    channel = self.channels.get(request_id)
+                    is_exec = request_id in self.active_execs or (
+                        channel and channel[0] == "exec"
+                    )
+                    is_mcp = request_id == self.active_mcp or (
+                        channel and channel[0] == "mcp"
+                    )
+                    if (
+                        is_exec
+                        and kind not in {"data", "exit", "error"}
+                        or is_mcp
+                        and kind not in {"mcp_data", "mcp_end", "error"}
+                        or channel
+                        and channel[0] == "tcp"
+                        and kind in {"mcp_data", "mcp_end"}
+                    ):
+                        raise ValueError("invalid channel response")
+                    if (
+                        is_exec
+                        and kind == "data"
+                        and frame.get("stream") not in {"stdout", "stderr"}
+                    ):
+                        raise ValueError("invalid output stream")
+                    # Disconnected calls keep their slots until the supervisor
+                    # confirms termination, independently of HTTP channel lifetime.
+                    if kind in {"exit", "error"} and request_id in self.active_execs:
+                        self.active_execs.remove(request_id)
                         self.last_exec_activity = time.monotonic()
                         self.idle_since = None
                     if kind in {"mcp_end", "error"} and request_id == self.active_mcp:
                         self.active_mcp = None
                         self.last_exec_activity = time.monotonic()
                         self.idle_since = None
-                    channel = self.channels.get(request_id)
                     if channel:
-                        if (
-                            channel[0] == "mcp"
-                            and kind not in {"mcp_data", "mcp_end", "error"}
-                        ) or (channel[0] != "mcp" and kind in {"mcp_data", "mcp_end"}):
-                            raise ValueError("invalid MCP channel response")
-                        if (
-                            kind == "data"
-                            and channel[0] == "exec"
-                            and frame.get("stream") not in {"stdout", "stderr"}
-                        ):
-                            raise ValueError("invalid output stream")
                         try:
-                            if channel[0] == "exec":
-                                await asyncio.wait_for(channel[1].put(frame), 1)
-                            else:
-                                # Let active consumers run without allowing a slow
-                                # TCP peer to block every other protocol channel.
-                                await asyncio.sleep(0)
-                                channel[1].put_nowait(frame)
-                        except (asyncio.QueueFull, asyncio.TimeoutError):
+                            # Give consumers a turn without waiting on one slow
+                            # caller and blocking other calls or heartbeats.
+                            await asyncio.sleep(0)
+                            channel[1].put_nowait(frame)
+                        except asyncio.QueueFull:
                             self.channels.pop(request_id, None)
                             while not channel[1].empty():
                                 channel[1].get_nowait()
@@ -274,6 +286,7 @@ class Manager:
             )
         for key, default in (
             ("max_runtimes", 4),
+            ("max_execs", 4),
             ("max_connections", 128),
             ("max_ports", 128),
             ("max_lifetime_seconds", 86400),
@@ -284,6 +297,7 @@ class Manager:
             "memory_max",
             "tasks_max",
             "max_runtimes",
+            "max_execs",
             "max_connections",
             "max_ports",
             "max_lifetime_seconds",
@@ -468,6 +482,8 @@ class Manager:
             self.config["python"],
             "--supervisor",
             self.config["supervisor"],
+            "--max-execs",
+            str(self.config["max_execs"]),
             *(
                 ["--playwright-mcp", self.config["playwright_mcp"]]
                 if "playwright_mcp" in self.config
@@ -583,7 +599,7 @@ class Manager:
         return (
             runtime.started
             and not runtime.stopped
-            and runtime.active_exec is None
+            and not runtime.active_execs
             and runtime.active_mcp is None
             and not any(
                 kind in {"exec", "mcp"} for kind, _ in runtime.channels.values()
@@ -979,38 +995,62 @@ class Manager:
         # Validate the encoded supervisor frame before allocating a sandbox.
         try:
             encoded = frame_bytes(
-                {"op": "exec", "id": "0" * 24, "argv": argv, "cwd": body["directory"]}
+                {
+                    "op": "exec",
+                    "id": "0" * 24,
+                    "argv": argv,
+                    "cwd": body["directory"],
+                    "credits": QUEUE_SIZE - 1,
+                }
             )
             if len(encoded) > 128 * 1024:
                 raise ValueError("exec frame too large")
         except (ValueError, TypeError):
             raise web.HTTPBadRequest(text="exec frame too large") from None
         runtime, cwd = await self._get_runtime(body["directory"], body["session_id"])
-        if runtime.active_exec is not None or any(
-            kind == "exec" for kind, _ in runtime.channels.values()
-        ):
-            raise web.HTTPConflict(text="session already has an active command")
+        # Include calls reserved before send and calls still terminating after
+        # disconnect. Count each ID once and reserve without yielding.
+        reserved = {
+            key for key, (kind, _) in runtime.channels.items() if kind == "exec"
+        }
+        if len(runtime.active_execs | reserved) >= self.config["max_execs"]:
+            raise web.HTTPConflict(text="session shell concurrency limit reached")
         request_id, queue = runtime.channel("exec")
         response = web.StreamResponse(headers={"Content-Type": "application/x-ndjson"})
         finished = False
         try:
             await response.prepare(request)
             await runtime.send(
-                {"op": "exec", "id": request_id, "argv": argv, "cwd": str(cwd)}
+                # Leave one channel slot for the terminal frame. Replenish data
+                # credits only after forwarding output to this call's consumer.
+                {
+                    "op": "exec",
+                    "id": request_id,
+                    "argv": argv,
+                    "cwd": str(cwd),
+                    "credits": QUEUE_SIZE - 1,
+                }
             )
             while True:
                 if request.transport is None or request.transport.is_closing():
                     break
                 try:
-                    frame = await asyncio.wait_for(queue.get(), 0.1)
+                    async with asyncio.timeout(0.1):
+                        frame = await queue.get()
                 except asyncio.TimeoutError:
                     continue
                 kind = frame["event"]
                 if kind == "data":
-                    await asyncio.wait_for(response.write(frame_bytes(frame)), 30)
+                    async with asyncio.timeout(30):
+                        await response.write(frame_bytes(frame))
+                    if request_id in runtime.active_execs:
+                        await runtime.send(
+                            {"op": "exec_credit", "id": request_id, "credits": 1}
+                        )
                 elif kind == "exit":
                     finished = True
-                    await asyncio.wait_for(response.write(frame_bytes(frame)), 30)
+                    async with asyncio.timeout(30):
+                        await response.write(frame_bytes(frame))
                     break
                 elif kind == "error":
                     await response.write(
