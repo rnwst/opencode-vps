@@ -828,7 +828,7 @@ class MCPUnitTests(unittest.TestCase):
     def test_launch_quotes_and_passes_only_configured_mcp_path(self):
         launch = test_manager.launch
         root = Path("/sys/fs/cgroup/service")
-        group = root / ("runtime-" + "a" * 24)
+        group = root / "workloads" / ("runtime-" + "a" * 24)
         executable = "/fixed/path with space/mcp;not-a-command"
         argv = [
             "launch.py",

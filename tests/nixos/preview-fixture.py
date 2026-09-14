@@ -5,6 +5,7 @@ import base64
 import errno
 import http.client
 import json
+import mmap
 import os
 import re
 import shlex
@@ -32,6 +33,34 @@ def denied(operation, allowed=(errno.EACCES, errno.EPERM, errno.ENOENT)):
         assert error.errno in allowed, error
     else:
         raise AssertionError("Forbidden operation succeeded")
+
+
+def allocate(memory_max):
+    # Host-controlled gates let the test set OOM scores before any pressure.
+    # Keep both allocation and waiting bounded even if the host assertion fails.
+    signal.alarm(90)
+    prefix = Path("pool-allocator")
+    prefix.with_suffix(".ready").touch()
+    chunks = []
+    chunk_size = 8 * 1024 * 1024
+    for gate, target in (
+        ("hold", memory_max // 2 + 64 * 1024 * 1024),
+        ("oom", memory_max * 2),
+    ):
+        while not prefix.with_suffix("." + gate).exists():
+            time.sleep(0.05)
+        while len(chunks) * chunk_size < target:
+            chunk = mmap.mmap(
+                -1, chunk_size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+            )
+            # Reserving address space alone cannot exercise memory.max.
+            chunk[:: mmap.PAGESIZE] = b"x" * (chunk_size // mmap.PAGESIZE)
+            chunks.append(chunk)
+            time.sleep(0.01)
+        prefix.with_suffix("." + gate + "-filled").write_text(
+            str(len(chunks) * chunk_size)
+        )
+    raise AssertionError("Allocator exceeded twice the pool cap without being killed")
 
 
 def probe(manifest_path):
@@ -216,6 +245,8 @@ def integration(wrapper, config_path, task):
     assert config["public_host"] == PUBLIC and config["preview_domain"] == "example.com"
     assert config["runtime_root"] == str(RUNTIME)
     assert Path(config["playwright_mcp"]).is_file()
+    assert "cpu_quota" not in config
+    assert 0 < config["memory_max"] <= 1024 * 1024 * 1024
 
     def client(workspace, session, *args, expected=0):
         result = subprocess.run(
@@ -395,13 +426,34 @@ def integration(wrapper, config_path, task):
         assert host not in directory()
         assert request(host, "/")[0] == 404
 
-    def snapshot(entry, browser=False):
-        group = parent / ("runtime-" + entry["runtime"])
-        assert group.is_dir(), group
+    def pool_limits():
+        assert pool.is_dir(), pool
+        assert {path for path in parent.iterdir() if path.is_dir()} == {manager, pool}
+        assert not (parent / "cgroup.procs").read_text().strip()
+        assert not (pool / "cgroup.procs").read_text().strip()
+        for group in (parent, pool):
+            assert {"cpu", "memory", "pids"} <= set(
+                (group / "cgroup.subtree_control").read_text().split()
+            ), group
         for name, value in (
             ("memory.max", str(config["memory_max"])),
+            ("memory.high", "max"),
+            ("memory.oom.group", "0"),
+            ("cpu.max", "max 100000"),
+        ):
+            assert (pool / name).read_text().strip() == value, (pool, name)
+
+    def snapshot(entry, browser=False):
+        pool_limits()
+        group = pool / ("runtime-" + entry["runtime"])
+        assert group.is_dir(), group
+        for name, value in (
+            ("memory.max", "max"),
+            ("memory.high", "max"),
+            ("memory.oom.group", "1"),
             ("pids.max", str(config["tasks_max"])),
-            ("cpu.max", f"{config['cpu_quota'] * 1000} 100000"),
+            ("cpu.max", "max 100000"),
+            ("cpu.weight", "100"),
         ):
             assert (group / name).read_text().strip() == value, name
         pids = {
@@ -427,10 +479,18 @@ def integration(wrapper, config_path, task):
                     ), (pid, namespace)
         return group, pids
 
-    def cleaned(snapshot):
+    def cleaned(snapshot, service_restart=False):
         group, pids = snapshot
+        # systemd may rebuild the service cgroup tree on restart. Ordinary
+        # runtime teardown, including OOM, must leave the live pool intact.
+        if not service_restart:
+            pool_limits()
+        assert group.parent == pool and pids, snapshot
         assert not group.exists(), group
         assert all(not Path(f"/proc/{pid}").exists() for pid in pids), pids
+        runtime_id = group.name.removeprefix("runtime-")
+        assert not (RUNTIME / "broker" / runtime_id).exists()
+        assert not list((RUNTIME / "u").glob(runtime_id + "-*.sock"))
 
     print("Checking real systemd delegation and native OpenCode forwarding", flush=True)
     control = RUNTIME / "control.sock"
@@ -445,6 +505,14 @@ def integration(wrapper, config_path, task):
     manager = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
     assert manager.name == "manager", manager
     parent = manager.parent
+    pool = parent / "workloads"
+    assert (
+        subprocess.check_output(
+            ["systemctl", "show", "-p", "OOMPolicy", "--value", "opencode-previews"],
+            text=True,
+        ).strip()
+        == "continue"
+    )
     assert {"cpu", "memory", "pids"} <= set(
         (parent / "cgroup.controllers").read_text().split()
     )
@@ -472,9 +540,7 @@ def integration(wrapper, config_path, task):
     start("alpha", "ses_alpha", "alpha source")
     start("beta", "ses_beta", "beta source")
     entry_a, entry_b = eventually(lambda: ready(a)), eventually(lambda: ready(b))
-    assert {"cpu", "memory", "pids"} <= set(
-        (parent / "cgroup.subtree_control").read_text().split()
-    )
+    pool_limits()
     cookie_a, cookie_b = login(a, entry_a), login(b, entry_b)
     content(a, cookie_a, "alpha source")
     content(b, cookie_b, "beta source")
@@ -766,7 +832,7 @@ def integration(wrapper, config_path, task):
                 {
                     "hidden": hidden,
                     "sockets": sockets,
-                    "cgroup": str(parent / ("runtime-" + entry["runtime"])),
+                    "cgroup": str(pool / ("runtime-" + entry["runtime"])),
                 }
             )
         )
@@ -891,6 +957,131 @@ def integration(wrapper, config_path, task):
     eventually(lambda: cleaned(task_snapshot))
     gone(task_host)
 
+    print("Checking shared pool borrowing and isolated group OOM", flush=True)
+    empty()
+    pool_limits()
+    assert not list(pool.glob("runtime-*"))
+    # Anonymous memory must hit the pool limit, not escape into VM swap.
+    assert len(Path("/proc/swaps").read_text().splitlines()) == 1
+    start("alpha", "ses_poolvictim", "pool victim")
+    start("beta", "ses_poolsibling", "pool survivor")
+    victim, sibling = eventually(lambda: ready(a)), eventually(lambda: ready(b))
+    sibling_cookie = login(b, sibling)
+    sibling_snapshot = snapshot(sibling)
+    pool_inode = pool.stat().st_ino
+
+    def process_identity(pid):
+        # Start time rules out a recycled PID; comm can contain spaces or ')'.
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+    manager_identity = process_identity(pid)
+    sibling_identities = {
+        child: process_identity(child) for child in sibling_snapshot[1]
+    }
+
+    def survivor_healthy():
+        assert (
+            subprocess.check_output(
+                ["systemctl", "show", "-p", "MainPID", "--value", "opencode-previews"],
+                text=True,
+            ).strip()
+            == pid
+        )
+        assert process_identity(pid) == manager_identity
+        assert pid in (manager / "cgroup.procs").read_text().split()
+        subprocess.run(
+            ["systemctl", "is-active", "--quiet", "opencode-previews"],
+            check=True,
+            timeout=5,
+        )
+        assert ready(b) == sibling
+        content(b, sibling_cookie, "pool survivor")
+        assert snapshot(sibling)[0] == sibling_snapshot[0]
+        for child, identity in sibling_identities.items():
+            assert process_identity(child) == identity, child
+        assert pool.stat().st_ino == pool_inode
+        assert request(path="/health")[2] == "fake OpenCode health"
+
+    def pool_events(name="memory.events"):
+        return {
+            key: int(value)
+            for key, value in (
+                line.split() for line in (pool / name).read_text().splitlines()
+            )
+        }
+
+    before_oom = pool_events()
+    before_local_oom = pool_events("memory.events.local")["oom"]
+    shell(
+        "alpha",
+        "ses_poolvictim",
+        f"python3 {shlex.quote(__file__)} allocate {config['memory_max']} "
+        "> pool-allocator.log 2>&1 < /dev/null &",
+    )
+    allocator = root / "alpha/pool-allocator"
+    eventually(lambda: present(allocator.with_suffix(".ready")))
+    victim_snapshot = snapshot(victim)
+    assert any(
+        b"allocate" in Path(f"/proc/{child}/cmdline").read_bytes()
+        for child in victim_snapshot[1]
+    ), victim_snapshot
+    victim_broker = RUNTIME / "broker" / victim["runtime"]
+    victim_sockets = list((RUNTIME / "u").glob(victim["runtime"] + "-*.sock"))
+    assert victim_broker.is_dir() and victim_sockets
+    # Prefer this leaf explicitly, including PID-namespace init and helpers.
+    # Never exempt a victim child with -1000: group OOM must kill the whole leaf.
+    for child in victim_snapshot[1]:
+        score = Path(f"/proc/{child}/oom_score_adj")
+        score.write_text("1000")
+        assert score.read_text().strip() == "1000", child
+    for child in sibling_snapshot[1]:
+        assert int(Path(f"/proc/{child}/oom_score_adj").read_text()) < 1000, child
+    allocator.with_suffix(".hold").touch()
+
+    def borrowed():
+        survivor_healthy()
+        held = allocator.with_suffix(".hold-filled").read_text()
+        assert held.isdecimal(), held
+        assert int(held) > config["memory_max"] // 2
+        assert int((victim_snapshot[0] / "memory.current").read_text()) > (
+            config["memory_max"] // 2
+        )
+        assert set(pool.glob("runtime-*")) == {victim_snapshot[0], sibling_snapshot[0]}
+        assert pool_events()["oom"] == before_oom["oom"]
+
+    eventually(borrowed)
+    allocator.with_suffix(".oom").touch()
+
+    def pool_oom():
+        survivor_healthy()
+        events = pool_events()
+        assert events["oom"] > before_oom["oom"], events
+        assert pool_events("memory.events.local")["oom"] > before_local_oom
+        assert events["oom_kill"] > before_oom["oom_kill"], events
+        assert events["oom_group_kill"] > before_oom["oom_group_kill"], events
+        assert not allocator.with_suffix(".oom-filled").exists()
+
+    eventually(pool_oom, timeout=45)
+    eventually(lambda: cleaned(victim_snapshot))
+    eventually(lambda: gone(a))
+    assert all(not path.exists() for path in victim_sockets)
+    survivor_healthy()
+    assert shell("beta", "ses_poolsibling", "printf sibling-exec") == "sibling-exec"
+    survivor_healthy()
+    client(
+        "beta",
+        "ses_poolsibling",
+        "stop",
+        "--session",
+        "ses_poolsibling",
+        "--directory",
+        str(root / "beta"),
+    )
+    eventually(lambda: cleaned(sibling_snapshot))
+    empty()
+    assert pool.stat().st_ino == pool_inode
+    assert not list(pool.glob("runtime-*"))
+
     print(
         "Checking service restart revokes capabilities and removes all binders",
         flush=True,
@@ -915,14 +1106,24 @@ def integration(wrapper, config_path, task):
     old_cookie = login(a, old_a)
     old_snapshots = snapshot(old_a, browser=True), snapshot(old_b)
     old_sockets = list((RUNTIME / "u").glob("*.sock"))
+    assert set(pool.glob("runtime-*")) == {old[0] for old in old_snapshots}
+    assert old_sockets
     subprocess.run(
         ["systemctl", "restart", "opencode-previews"], check=True, timeout=60
     )
     subprocess.run(["systemctl", "is-active", "--quiet", "opencode"], check=True)
     eventually(lambda: empty())
+    restarted_pid = subprocess.check_output(
+        ["systemctl", "show", "-p", "MainPID", "--value", "opencode-previews"],
+        text=True,
+    ).strip()
+    assert restarted_pid != pid
+    assert restarted_pid in (manager / "cgroup.procs").read_text().split()
     for old in old_snapshots:
-        eventually(lambda old=old: cleaned(old))
-    assert not list(parent.glob("runtime-*"))
+        eventually(lambda old=old: cleaned(old, service_restart=True))
+    if pool.exists():
+        pool_limits()
+    assert not list(parent.rglob("runtime-*"))
     assert not list((RUNTIME / "u").iterdir())
     assert not list((RUNTIME / "broker").iterdir())
     assert all(not path.exists() for path in old_sockets)
@@ -965,6 +1166,8 @@ if __name__ == "__main__":
         asyncio.run(serve())
     elif sys.argv[1] == "probe":
         probe(sys.argv[2])
+    elif sys.argv[1] == "allocate":
+        allocate(int(sys.argv[2]))
     elif sys.argv[1] == "test":
         integration(*sys.argv[2:])
     else:

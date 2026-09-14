@@ -30,7 +30,7 @@ def main():
     group = Path(args.cgroup)
     root = delegated_root()
     if (
-        group.parent != root
+        group.parent != root / "workloads"
         or not re.fullmatch(r"runtime-[a-f0-9]{24}", group.name)
         or group.is_symlink()
         or group.resolve(strict=True) != group

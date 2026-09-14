@@ -145,7 +145,6 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             "launch": str(SOURCE / "launch.py"),
             "memory_max": 1024 * 1024,
             "tasks_max": 128,
-            "cpu_quota": 100,
         }
         self.manager = FakeManager(self.config)
         await self.manager.start()
@@ -193,7 +192,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
     def test_config_validation(self):
         for key, value in (
             ("memory_max", True),
-            ("cpu_quota", 0),
+            ("cpu_quota", 200),
             ("tasks_max", "128"),
             ("launch", "relative.py"),
             ("preview_domain", "bad..test"),
@@ -991,26 +990,45 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
     def test_cgroup_limits_are_required_before_spawn(self):
         root = Path("/sys/fs/cgroup/service")
+        pool = root / "workloads"
         writes = {}
 
         def write(path, value):
-            writes[path.name] = value
+            self.assertNotIn(
+                path, writes, "Shared limits must not be rewritten while workloads run"
+            )
+            writes[path] = value
 
         with (
             patch.object(module, "delegated_root", return_value=root),
             patch.object(Path, "read_text", return_value="cpu memory pids"),
             patch.object(Path, "write_text", write),
             patch.object(Path, "mkdir"),
+            patch.object(
+                Path, "resolve", autospec=True, side_effect=lambda path, **_: path
+            ),
         ):
             group = self.manager._create_cgroup("a" * 24)
-        self.assertEqual(group, root / ("runtime-" + "a" * 24))
+            sibling = self.manager._create_cgroup("b" * 24)
+        self.assertEqual(group, pool / ("runtime-" + "a" * 24))
+        self.assertEqual(sibling.parent, pool)
         self.assertEqual(
             writes,
             {
-                "cgroup.subtree_control": "+cpu +memory +pids",
-                "memory.max": "1048576",
-                "pids.max": "128",
-                "cpu.max": "100000 100000",
+                root / "cgroup.subtree_control": "+cpu +memory +pids",
+                pool / "memory.max": "1048576",
+                pool / "memory.high": "max",
+                pool / "memory.oom.group": "0",
+                pool / "cpu.max": "max 100000",
+                pool / "cgroup.subtree_control": "+cpu +memory +pids",
+                group / "memory.oom.group": "1",
+                group / "pids.max": "128",
+                group / "cpu.max": "max 100000",
+                group / "cpu.weight": "100",
+                sibling / "memory.oom.group": "1",
+                sibling / "pids.max": "128",
+                sibling / "cpu.max": "max 100000",
+                sibling / "cpu.weight": "100",
             },
         )
         with (
@@ -1018,11 +1036,60 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(Path, "read_text", return_value="cpu memory"),
             self.assertRaises(RuntimeError),
         ):
+            module.Manager(self.config)._create_cgroup("a" * 24)
+
+    def test_cgroup_setup_failure_does_not_remove_shared_pool(self):
+        root = Path("/sys/fs/cgroup/service")
+        pool = root / "workloads"
+        group = pool / ("runtime-" + "a" * 24)
+        for failed in (
+            pool / "memory.max",
+            pool / "cgroup.subtree_control",
+            group / "memory.oom.group",
+            group / "cpu.weight",
+        ):
+
+            def write(path, value):
+                if path == failed:
+                    raise OSError("cgroup setup failed")
+
+            with (
+                self.subTest(failed=failed),
+                patch.object(module, "delegated_root", return_value=root),
+                patch.object(Path, "read_text", return_value="cpu memory pids"),
+                patch.object(Path, "write_text", write),
+                patch.object(Path, "mkdir", autospec=True) as mkdir,
+                patch.object(Path, "rmdir", autospec=True) as rmdir,
+                patch.object(
+                    Path, "resolve", autospec=True, side_effect=lambda path, **_: path
+                ),
+                self.assertRaises(OSError),
+            ):
+                module.Manager(self.config)._create_cgroup("a" * 24)
+            if failed.parent == pool:
+                mkdir.assert_called_once_with(pool, exist_ok=True)
+                rmdir.assert_not_called()
+            else:
+                rmdir.assert_called_once_with(group)
+
+    def test_cgroup_pool_alias_rejected_before_setting_limits(self):
+        root = Path("/sys/fs/cgroup/service")
+        with (
+            patch.object(module, "delegated_root", return_value=root),
+            patch.object(Path, "read_text", return_value="cpu memory pids"),
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "resolve", return_value=root / "manager"),
+            patch.object(Path, "write_text", autospec=True) as write,
+            self.assertRaises(RuntimeError),
+        ):
             self.manager._create_cgroup("a" * 24)
+        write.assert_called_once_with(
+            root / "cgroup.subtree_control", "+cpu +memory +pids"
+        )
 
     def test_launch_enters_cgroup_before_fixed_shell_command(self):
         root = Path("/sys/fs/cgroup/service")
-        group = root / ("runtime-" + "a" * 24)
+        group = root / "workloads" / ("runtime-" + "a" * 24)
         steps = []
 
         def write(path, value):
@@ -1067,6 +1134,46 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
         )
+
+    def test_launch_rejects_cgroups_outside_pool_and_aliases(self):
+        root = Path("/sys/fs/cgroup/service")
+        name = "runtime-" + "a" * 24
+        valid = root / "workloads" / name
+        for group, resolved, symlink in (
+            (root / name, root / name, False),
+            (root / "manager" / name, root / "manager" / name, False),
+            (valid / name, valid / name, False),
+            (valid, root / "other" / name, False),
+            (valid, valid, True),
+        ):
+            with (
+                self.subTest(group=group, resolved=resolved, symlink=symlink),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "launch.py",
+                        "--cgroup",
+                        str(group),
+                        "--sandbox-exec",
+                        "/fixed/sandbox",
+                        "--python",
+                        "/fixed/python",
+                        "--supervisor",
+                        "/fixed/supervisor.py",
+                    ],
+                ),
+                patch.object(launch, "delegated_root", return_value=root),
+                patch.object(Path, "resolve", return_value=resolved),
+                patch.object(Path, "is_symlink", return_value=symlink),
+                patch.object(Path, "write_text") as write,
+                patch.object(launch.os, "execv") as execute,
+                patch.object(sys, "stderr"),
+                self.assertRaises(SystemExit),
+            ):
+                launch.main()
+            write.assert_not_called()
+            execute.assert_not_called()
 
     def test_client_fallback_is_configured_not_environment_selected(self):
         config = self.base / "config.json"

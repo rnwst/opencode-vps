@@ -268,6 +268,10 @@ class Runtime:
 class Manager:
     def __init__(self, config):
         self.config = dict(config)
+        if "cpu_quota" in self.config:
+            raise ValueError(
+                "cpu_quota is no longer supported; CPU uses weighted sharing"
+            )
         for key, default in (
             ("max_runtimes", 4),
             ("max_connections", 128),
@@ -279,7 +283,6 @@ class Manager:
         for key in (
             "memory_max",
             "tasks_max",
-            "cpu_quota",
             "max_runtimes",
             "max_connections",
             "max_ports",
@@ -318,6 +321,7 @@ class Manager:
         self.runtime_root = Path(self.config["runtime_root"])
         self.workspaces_root = Path(self.config["workspaces_root"])
         self.tmp_root = Path(self.config["workspaces_tmp_root"])
+        self.workload_cgroup = None
         self.runtimes = {}
         self.mappings = {}
         self.lock = asyncio.Lock()
@@ -398,17 +402,33 @@ class Manager:
         return dict(mapping) if mapping is not None else None
 
     def _create_cgroup(self, runtime_id):
-        root = delegated_root()
-        required = {"cpu", "memory", "pids"}
-        if not required <= set((root / "cgroup.controllers").read_text().split()):
-            raise RuntimeError("required cgroup controllers are not delegated")
-        (root / "cgroup.subtree_control").write_text("+cpu +memory +pids")
-        group = root / ("runtime-" + runtime_id)
+        if self.workload_cgroup is None:
+            root = delegated_root()
+            required = {"cpu", "memory", "pids"}
+            if not required <= set((root / "cgroup.controllers").read_text().split()):
+                raise RuntimeError("required cgroup controllers are not delegated")
+            (root / "cgroup.subtree_control").write_text("+cpu +memory +pids")
+            # Keep the manager outside the pool. Configure it before admitting
+            # workloads: rewriting a live memory.max can block on reclaim.
+            pool = root / "workloads"
+            pool.mkdir(exist_ok=True)
+            if pool.resolve(strict=True) != pool:
+                raise RuntimeError("invalid workload cgroup")
+            (pool / "memory.max").write_text(str(self.config["memory_max"]))
+            (pool / "memory.high").write_text("max")
+            (pool / "memory.oom.group").write_text("0")
+            (pool / "cpu.max").write_text("max 100000")
+            (pool / "cgroup.subtree_control").write_text("+cpu +memory +pids")
+            self.workload_cgroup = pool
+        group = self.workload_cgroup / ("runtime-" + runtime_id)
         group.mkdir()
         try:
-            (group / "memory.max").write_text(str(self.config["memory_max"]))
+            # If selected by the OOM killer, retire the entire sandbox rather
+            # than leave a half-alive supervisor, proxy, or browser behind.
+            (group / "memory.oom.group").write_text("1")
             (group / "pids.max").write_text(str(self.config["tasks_max"]))
-            (group / "cpu.max").write_text(f"{self.config['cpu_quota'] * 1000} 100000")
+            (group / "cpu.max").write_text("max 100000")
+            (group / "cpu.weight").write_text("100")
         except BaseException:
             group.rmdir()
             raise

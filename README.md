@@ -335,21 +335,35 @@ label of `publicHostName`: `opencode.example.com` becomes `example.com`.
 | `maxRuntimes` | `4` | Host-wide concurrent session/workspace runtimes |
 | `maxPorts` | `128` | Distinct ports discovered over one runtime's lifetime |
 | `maxConnections` | `128` | Per-runtime connection/channel limit |
-| `memoryMax` | `2147483648` (2 GiB) | Per-runtime cgroup memory limit, in bytes |
+| `memoryMax` | `9663676416` (9 GiB) | Combined cgroup memory ceiling for all runtimes, in bytes |
 | `tasksMax` | `512` | Per-runtime cgroup process/thread limit |
-| `cpuQuota` | `200` | Per-runtime CPU quota in percent (two CPUs) |
 | `maxLifetimeSeconds` | `86400` | Maximum runtime age (24 hours) |
 | `idleTimeoutSeconds` | `300` | Retire empty runtimes after five idle minutes |
 
-The resource cgroup includes both the SRT proxy and the workload. Override only
-the necessary values inside the host settings attribute set, for example:
+Runtimes share a workload-only memory pool, including their SRT proxies and
+browsers. One runtime can use the whole pool; starting another does not divide
+or shrink its allowance. There is no soft memory threshold (`memory.high` is
+`max`). At the hard ceiling, Linux reclaims memory and may OOM-kill a selected
+runtime as a group if reclaim cannot satisfy allocations. The manager/gateway
+and OpenCode are outside this pool, and sibling runtimes are not group-killed
+with the victim. Continued pressure can still kill further runtimes.
+
+CPU has no hard quota. Equal cgroup weights share CPU between busy runtimes and
+allow a lone compilation to use spare CPUs. The old `cpuQuota` setting is no
+longer accepted. Shell/browser call concurrency and per-runtime process limits
+are unchanged.
+
+Size the memory pool below physical RAM to leave room for host services and
+OpenCode. The ceiling covers charged resident memory, not RAM plus swap; swap
+access is unchanged, and zram itself consumes physical RAM. Override only the
+necessary values inside the host settings attribute set, for example:
 
 ```nix
 publicHostName = "opencode.example.com";
 previews = {
   domain = "example.com";
   maxRuntimes = 4;
-  memoryMax = 2147483648;
+  memoryMax = 9663676416;
 };
 ```
 

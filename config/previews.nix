@@ -1,4 +1,7 @@
 { lib, settings }:
+assert lib.assertMsg (
+  !((settings.previews or { }) ? cpuQuota)
+) "previews.cpuQuota is no longer supported; runtimes use weighted CPU sharing.";
 {
   enable = true;
   # Keep deployment domains in the local settings override, not this template.
@@ -10,9 +13,8 @@
   maxRuntimes = 4;
   maxPorts = 128;
   maxConnections = 128;
-  memoryMax = 2147483648;
+  memoryMax = 9663676416;
   tasksMax = 512;
-  cpuQuota = 200;
   maxLifetimeSeconds = 86400;
   idleTimeoutSeconds = 300;
 }

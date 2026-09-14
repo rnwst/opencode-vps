@@ -37,7 +37,6 @@ let
       playwright_mcp = "${playwrightMcp}/bin/opencode-playwright-mcp";
       memory_max = cfg.memoryMax;
       tasks_max = cfg.tasksMax;
-      cpu_quota = cfg.cpuQuota;
       max_runtimes = cfg.maxRuntimes;
       max_ports = cfg.maxPorts;
       max_connections = cfg.maxConnections;
