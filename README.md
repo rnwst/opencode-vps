@@ -44,6 +44,7 @@ flake.
 | OpenCode       | Pinned package, HTTP Basic Auth, OpenAI provider, sharing/snapshots/autoupdate disabled     |
 | Agent commands | Managed shell wrapper, Sandbox Runtime, bubblewrap, curated egress, worktree-only writes    |
 | Previews       | Persistent session loopback, automatic HTTP port discovery, authenticated per-host access   |
+| Browser tools  | Pinned Playwright MCP, headless Chromium inside the calling session's sandbox               |
 | GitHub         | Root-owned token for operators; masked API and Git HTTPS authentication for agents          |
 | GitHub bridge  | Conditional notification polling, numeric controller-ID checks, persistent session routing  |
 | Task storage   | Canonical Btrfs repositories with cheap, independent writable task snapshots                |
@@ -78,6 +79,42 @@ Git receives the masked credential through environment-based configuration, and
 Sandbox Runtime's TLS proxy restores it only in HTTPS requests to `github.com`.
 GitHub API clients use the separately masked token, restored for `github.com`
 and `api.github.com`.
+
+### Playwright MCP
+
+With previews enabled, managed OpenCode configuration enables the `playwright`
+MCP server. Both the MCP package and its matching Chromium headless shell come
+from pinned stable nixpkgs; no runtime npm installation or browser download is
+needed.
+
+OpenCode shares MCP connections across conversations, so the managed plugin
+adds trusted session routing metadata to each `playwright_*` tool call. A
+stdio adapter forwards it over the existing private runtime control socket.
+Tool schemas are captured from the pinned upstream package at build time; no
+browser or upstream tool code runs in the host adapter. The runtime supervisor
+owns a separate persistent MCP child for each session, independent of shell
+execution and subject to the same workspace ownership, resource limits, and
+runtime teardown. Missing routing metadata fails closed.
+
+The browser reaches the session's development servers at
+`http://localhost:PORT`. Public websites go through SRT's authenticated proxy;
+private destinations and SSH remain blocked. Only exact session loopback
+addresses bypass the proxy. Chromium trusts the sandbox's CA bundle without
+disabling TLS verification. Its headless shell works with the existing
+Unix-socket filter; Chromium's inner sandbox is disabled because the mandatory
+outer bubblewrap/seccomp sandbox already applies. No host CDP endpoint or public
+MCP listener is exposed.
+
+Browser state persists between calls within a session. Closing the browser or
+its last tab retires the MCP helper so an otherwise idle runtime can expire.
+Tool errors and cancellation also reset the browser. A nested PID namespace
+contains detached browser processes; if bounded cleanup cannot be confirmed,
+the entire session runtime stops rather than leaving processes behind.
+Screenshots can be returned inline; file output lives under the session-private
+`/tmp` and must be read through that session's shell tools before browser reset
+or closure. Browser-private files are removed only after process teardown.
+Playwright MCP is disabled when previews are disabled, rather than falling back
+to an unsandboxed host browser.
 
 ### Shell Sandbox Security
 
