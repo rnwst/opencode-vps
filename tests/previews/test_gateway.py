@@ -292,6 +292,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         )
         text = await response.text()
         self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["Referrer-Policy"], "same-origin")
         self.assertIn("&lt;script&gt;&quot;&amp;", text)
         self.assertNotIn("<unsafe>", text)
         self.assertIn('target="_blank" rel="noopener noreferrer"', text)
@@ -311,6 +312,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         for headers, token, expected in [
             ({"Origin": "https://" + PUBLIC}, csrf, 401),
             ({"Authorization": BASIC}, csrf, 403),
+            ({"Authorization": BASIC, "Origin": "null"}, csrf, 403),
             ({"Authorization": BASIC, "Origin": "https://" + FIRST}, csrf, 403),
             ({"Authorization": BASIC, "Origin": "https://" + PUBLIC}, "wrong", 403),
         ]:
@@ -322,6 +324,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 data={"csrf": token},
             )
             self.assertEqual(response.status, expected)
+            self.assertEqual(self.manager.stopped, [])
         headers = {"Authorization": BASIC, "Origin": "https://" + PUBLIC}
         response = await self.request(
             "/previews/stop/absent",
