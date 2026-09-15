@@ -22,6 +22,7 @@
       deadnix
       deno
       fd
+      ffmpeg
       fish-lsp
       gcc
       gdb
@@ -33,6 +34,7 @@
       gradle
       haskell-language-server
       helix
+      htop
       jdk
       jq
       just
@@ -70,6 +72,7 @@
       vscode-langservers-extracted
       wget
       yaml-language-server
+      yazi
       zip
       localPackages.jetls
       localPackages.jlfmt
@@ -112,6 +115,7 @@
         lg = "lazygit";
         oc = "opencode";
         s = "sudo";
+        y = "yazi";
       };
     };
 
