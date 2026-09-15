@@ -163,7 +163,6 @@
 
   environment.systemPackages = with pkgs; [
     curl
-    ffmpeg
     git
     vim
   ];
