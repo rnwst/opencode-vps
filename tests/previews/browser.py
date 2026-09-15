@@ -87,6 +87,7 @@ class Manager:
                 (OTHER, "beta", 3000),
             )
         ]
+        self.stopped = []
 
     def lookup(self, host):
         return next((e for e in self.entries if e["hostname"] == host), None)
@@ -95,7 +96,10 @@ class Manager:
         return self.entries
 
     async def stop(self, runtime_id):
-        raise AssertionError("Browser must not stop a runtime")
+        self.stopped.append(runtime_id)
+        self.entries = [
+            entry for entry in self.entries if entry["runtime_id"] != runtime_id
+        ]
 
 
 class BrowserTests(unittest.IsolatedAsyncioTestCase):
@@ -377,6 +381,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             if r["host"] == host and r["path"] == "/__preview_login"
         )
         self.assertEqual(login["status"], 303)
+        self.assertNotIn("referer", login["headers"])
         self.assertEqual(login["response_headers"]["location"], "/")
         self.assertEqual(len(login["cookies"]), 1)
         self.assertNotIn("domain=", login["cookies"][0].lower())
@@ -387,6 +392,9 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(app["status"], 200)
         for response in (login, app):
+            self.assertEqual(
+                response["response_headers"]["referrer-policy"], "no-referrer"
+            )
             for name in POLICY_HEADERS:
                 self.assertNotIn(name.lower(), response["response_headers"])
         upstream = next(r for r in reversed(self.upstream_requests) if r[0] == host)
@@ -440,6 +448,44 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mobile_directory_login_with_app_redirect(self):
         await self.directory_login(mobile=True, redirect=True)
+
+    async def directory_stop(self, mobile):
+        context = await self.context(mobile)
+        # Let Chromium send the form through real HTTPS without interception.
+        await context.unroute("**/*", self.edge)
+        page = await context.new_page()
+        response = await page.goto(f"https://{PUBLIC}/previews")
+        self.assertEqual(response.status, 200)
+        await expect(page.locator("article")).to_have_count(3)
+        async with page.expect_response(
+            f"https://{PUBLIC}/previews/stop/alpha"
+        ) as submitted:
+            await (
+                page.locator('form[action="/previews/stop/alpha"]')
+                .first.get_by_role("button", name="Stop / reset session")
+                .click()
+            )
+        response = await submitted.value
+        headers = await response.request.all_headers()
+        self.assertEqual(headers["origin"], f"https://{PUBLIC}")
+        self.assertEqual(response.request.method, "POST")
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.headers["location"], "/previews")
+        await expect(page).to_have_url(f"https://{PUBLIC}/previews")
+        await expect(page.locator("article")).to_have_count(1)
+        await expect(page.get_by_role("heading", name="workspace beta")).to_be_visible()
+        self.assertEqual(self.manager.stopped, ["alpha"])
+        self.assertEqual([e["hostname"] for e in self.manager.entries], [OTHER])
+        for host in (FIRST, SECOND):
+            response = await page.goto(f"https://{host}/")
+            self.assertEqual(response.status, 404)
+        self.assertEqual(self.external_requests, [])
+
+    async def test_desktop_directory_stop(self):
+        await self.directory_stop(mobile=False)
+
+    async def test_mobile_directory_stop(self):
+        await self.directory_stop(mobile=True)
 
     async def test_browser_origin_isolation_and_same_runtime_cors(self):
         context = await self.context()

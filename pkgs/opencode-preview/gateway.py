@@ -627,7 +627,8 @@ def create_app(config, manager, password):
             preview_headers(response.headers)
         elif request.path == "/previews" or request.path.startswith("/previews/"):
             response.headers["Cache-Control"] = "no-store"
-            response.headers["Referrer-Policy"] = "no-referrer"
+            # no-referrer makes native form POSTs send Origin: null.
+            response.headers["Referrer-Policy"] = "same-origin"
             response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         return response
 
