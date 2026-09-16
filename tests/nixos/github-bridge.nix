@@ -153,6 +153,7 @@ pkgs.testers.nixosTest {
               shell = "${testLocalPackages.sandbox-exec}/bin/opencode-sandbox-exec";
             };
             OPENCODE_DISABLE_DEFAULT_PLUGINS = "true";
+            OPENCODE_DISABLE_MODELS_FETCH = "true";
             OPENCODE_DISABLE_PROJECT_CONFIG = "1";
             OPENCODE_SERVER_PASSWORD = "test-password";
             XDG_CACHE_HOME = "${botHome}/.cache";
@@ -162,7 +163,7 @@ pkgs.testers.nixosTest {
           serviceConfig = {
             User = testSettings.accounts.bot.name;
             Group = "agent-workspaces";
-            ExecStart = "${testLocalPackages.opencode}/bin/opencode serve --hostname 127.0.0.1 --port 4096";
+            ExecStart = "${testLocalPackages.opencode}/bin/opencode --print-logs --log-level DEBUG serve --hostname 127.0.0.1 --port 4096";
             Restart = "on-failure";
           };
           preStart = ''
@@ -205,10 +206,16 @@ pkgs.testers.nixosTest {
     machine.wait_for_open_port(4096)
     machine.wait_for_unit("fake-github.service")
     machine.wait_for_open_port(4080)
-    machine.succeed(
-      "curl --fail --silent --user opencode:test-password "
-      "http://127.0.0.1:4096/global/health | jq -e .healthy"
-    )
+    curl = "curl --fail --silent --show-error --connect-timeout 5 --max-time 30 --user opencode:test-password "
+    try:
+      # The TCP socket can open before OpenCode registers its HTTP handlers.
+      machine.wait_until_succeeds(
+        curl + "http://127.0.0.1:4096/global/health | jq -e .healthy",
+        timeout=120,
+      )
+    except Exception:
+      print(machine.succeed("journalctl -u test-opencode.service --no-pager"))
+      raise
 
     machine.succeed("mkfs.btrfs -f /dev/vdb")
     machine.succeed("mkdir -p /srv/opencode")
@@ -351,27 +358,27 @@ pkgs.testers.nixosTest {
 
     directory = urllib.parse.quote("/srv/opencode/workspaces/alpha", safe="")
     created = machine.succeed(
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       "--header 'Content-Type: application/json' "
       "--data '{\"title\":\"Bridge test session\"}' "
       f"'http://127.0.0.1:4096/session?directory={directory}'"
     )
     session_id = json.loads(created)["id"]
     machine.succeed(
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       "--header 'Content-Type: application/json' "
       "--data '{\"noReply\":true,\"parts\":[{\"type\":\"text\","
       "\"text\":\"deterministic bridge prompt\"}]}' "
       f"'http://127.0.0.1:4096/session/{session_id}/prompt_async?directory={directory}'"
     )
     machine.wait_until_succeeds(
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       f"'http://127.0.0.1:4096/session/{session_id}/message?directory={directory}' "
       "| jq -e 'map(.parts[]? | select(.type == \"text\") | .text) "
       "| index(\"deterministic bridge prompt\")'"
     )
     manual_shell = machine.succeed(
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       "--header 'Content-Type: application/json' "
       "--data '{\"agent\":\"build\",\"model\":{\"providerID\":\"opencode\","
       "\"modelID\":\"big-pickle\"},\"command\":"
@@ -384,11 +391,11 @@ pkgs.testers.nixosTest {
       f"test -f /srv/opencode/workspace-tmp/alpha/{session_id}/manual-session"
     )
     machine.succeed(
-      "curl --fail --silent --user opencode:test-password --request POST "
+      f"{curl}--request POST "
       f"'http://127.0.0.1:4096/session/{session_id}/abort?directory={directory}'"
     )
     machine.succeed(
-      "curl --fail --silent --user opencode:test-password --request DELETE "
+      f"{curl}--request DELETE "
       f"'http://127.0.0.1:4096/session/{session_id}?directory={directory}'"
     )
     machine.wait_until_succeeds(
@@ -415,31 +422,31 @@ pkgs.testers.nixosTest {
       f"/srv/opencode/workspaces/.tasks/{task_id}", safe=""
     )
     machine.wait_until_succeeds(
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       f"'http://127.0.0.1:4096/session?directory={task_directory}' "
       "| jq -e '.[0].title | contains(\"owner/repo#1 implement\")'"
     )
     machine.wait_until_succeeds(
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       f"'http://127.0.0.1:4096/session?directory={task_directory}' "
       "| jq -er '.[0].id' > /tmp/task-session-id"
     )
     machine.wait_until_succeeds(
       "session=$(cat /tmp/task-session-id); "
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       f"\"http://127.0.0.1:4096/session/$session/message?directory={task_directory}\" "
       "| jq -e 'map(.parts[]? | select(.type == \"text\") | .text) "
       "| any(startswith(\"## GitHub Task\\n\\n- Action:\"))'"
     )
     machine.wait_until_succeeds(
       "session=$(cat /tmp/task-session-id); "
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       f"'http://127.0.0.1:4096/session/status?directory={task_directory}' "
       "| jq -e --arg session \"$session\" '(.[$session].type // \"idle\") == \"idle\"'"
     )
     machine.succeed(
       "session=$(cat /tmp/task-session-id); "
-      "curl --fail --silent --user opencode:test-password "
+      f"{curl}"
       "--header 'Content-Type: application/json' "
       "--data '{\"agent\":\"build\",\"model\":{\"providerID\":\"opencode\","
       "\"modelID\":\"big-pickle\"},\"command\":\"touch /tmp/from-opencode\"}' "
