@@ -2,6 +2,23 @@
 let
   # Never import deployment settings: those are also embedded in the wrapper.
   settings = {
+    accounts = {
+      bot = {
+        name = "test-bot";
+        git = {
+          name = "Test Bot";
+          email = "test-bot@example.com";
+        };
+      };
+      admin = {
+        name = "test-admin";
+        git = {
+          name = "Test Admin";
+          email = "test-admin@example.com";
+        };
+      };
+    };
+    githubReviewer = "test-reviewer";
     publicHostName = "opencode.example.com";
     opencodePort = 4096;
     workspacesRoot = "/srv/opencode/workspaces";
@@ -45,10 +62,10 @@ pkgs.testers.nixosTest {
     boot.kernel.sysctl."vm.panic_on_oom" = lib.mkForce 1;
     networking.firewall.enable = false;
     users.groups.agent-workspaces = { };
-    users.users.rnwst-bot = {
+    users.users.${settings.accounts.bot.name} = {
       isSystemUser = true;
       group = "agent-workspaces";
-      home = "/home/rnwst-bot";
+      home = "/home/${settings.accounts.bot.name}";
       createHome = true;
     };
     # The production service deliberately uses only the system/profile PATH.
@@ -66,7 +83,7 @@ pkgs.testers.nixosTest {
         for root in ${settings.workspacesRoot} ${settings.workspacesTmpRoot}; do
           install -d -m 0711 "$root/.tasks"
           for workspace in alpha beta ${task}; do
-            install -d -m 0700 -o rnwst-bot -g agent-workspaces "$root/$workspace"
+            install -d -m 0700 -o ${settings.accounts.bot.name} -g agent-workspaces "$root/$workspace"
           done
         done
       '';

@@ -79,14 +79,14 @@
         };
         github-bridge = import ./tests/github-bridge { inherit pkgs; };
         github-bridge-vm = import ./tests/nixos/github-bridge.nix {
-          inherit localPackages pkgs;
+          inherit pkgs pkgsUnstable;
         };
         sandbox-runtime = import ./tests/sandbox-runtime {
           inherit pkgs;
           sandboxRuntime = localPackages.sandbox-runtime;
         };
         sandbox-vm = import ./tests/nixos/sandbox.nix {
-          inherit localPackages pkgs;
+          inherit pkgs pkgsUnstable;
         };
         previews = import ./tests/previews { inherit pkgs; };
         previews-vm = import ./tests/nixos/previews.nix { inherit pkgs pkgsUnstable; };

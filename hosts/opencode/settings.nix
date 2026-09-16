@@ -8,6 +8,28 @@
   hostName = "opencode";
   publicHostName = "opencode.example.com";
 
+  # Unix accounts have homes at /home/<name>. Git identities are per-account,
+  # independent of repository ownership and the GitHub token's account.
+  accounts = {
+    admin = {
+      name = "opencode-admin";
+      git = {
+        name = "REPLACE-ME";
+        email = "REPLACE-ME@example.com";
+      };
+    };
+    bot = {
+      name = "opencode-bot";
+      git = {
+        name = "REPLACE-ME";
+        email = "REPLACE-ME@example.com";
+      };
+    };
+  };
+
+  # GitHub login to request as reviewer, not the bridge's authorization identity.
+  githubReviewer = "REPLACE-ME";
+
   # Set this to the stable identifier observed during the target preflight.
   # Leaving the sentinel in place makes disko fail rather than guessing a disk.
   diskDevice = "/dev/disk/by-id/REPLACE-ME";

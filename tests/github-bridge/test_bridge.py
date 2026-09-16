@@ -34,7 +34,7 @@ class FakeGitHub:
         self.graphql_responses: list[dict[str, Any]] = []
 
     def user(self) -> dict[str, Any]:
-        return {"id": 200, "login": "rnwst-bot"}
+        return {"id": 200, "login": "test-bot"}
 
     def pull(self, owner: str, repo: str, number: int) -> dict[str, Any]:
         return self.pulls.get(
@@ -262,30 +262,30 @@ class BridgeTest(unittest.TestCase):
     def test_mention_is_valid_anywhere_and_suffix_is_optional(self) -> None:
         self.assertEqual(
             bridge.parse_mention(
-                "Context first.\n\n@rnwst-bot implement\nAdd tests.", "rnwst-bot"
+                "Context first.\n\n@test-bot implement\nAdd tests.", "test-bot"
             ),
             ("implement", "implement Add tests."),
         )
         self.assertEqual(
-            bridge.parse_mention("Please @rnwst-bot answer", "rnwst-bot"),
+            bridge.parse_mention("Please @test-bot answer", "test-bot"),
             ("answer", "answer"),
         )
         self.assertEqual(
-            bridge.parse_mention("@rnwst-bot cancel ignored", "rnwst-bot"),
+            bridge.parse_mention("@test-bot cancel ignored", "test-bot"),
             ("cancel", "cancel"),
         )
 
     def test_multiple_commands_are_rejected(self) -> None:
         with self.assertRaisesRegex(bridge.BridgeError, "multiple"):
             bridge.parse_mention(
-                "@rnwst-bot answer then @rnwst-bot review", "rnwst-bot"
+                "@test-bot answer then @test-bot review", "test-bot"
             )
 
     def test_every_action_is_a_complete_bare_command(self) -> None:
         for action in ("answer", "implement", "review", "continue", "cancel"):
             with self.subTest(action=action):
                 self.assertEqual(
-                    bridge.parse_mention(f"Context. @rnwst-bot {action}", "rnwst-bot"),
+                    bridge.parse_mention(f"Context. @test-bot {action}", "test-bot"),
                     (action, action),
                 )
 
@@ -380,7 +380,7 @@ class BridgeTest(unittest.TestCase):
             "comment:bad",
             value,
             "999",
-            "@rnwst-bot implement malicious change",
+            "@test-bot implement malicious change",
             baseline=False,
         )
         self.assertEqual(self.database.event_state("comment:bad"), "ignored")
@@ -393,7 +393,7 @@ class BridgeTest(unittest.TestCase):
             "comment:closed",
             value,
             "100",
-            "@rnwst-bot implement",
+            "@test-bot implement",
             baseline=False,
         )
         self.assertEqual(self.database.event_state("comment:closed"), "ignored")
@@ -414,7 +414,7 @@ class BridgeTest(unittest.TestCase):
             "comment:cancel-closed",
             value,
             "100",
-            "@rnwst-bot cancel",
+            "@test-bot cancel",
             baseline=False,
         )
         self.instance.process_pending_events()
@@ -499,7 +499,7 @@ class BridgeTest(unittest.TestCase):
             "comment:41",
             value,
             "100",
-            "@rnwst-bot answer original",
+            "@test-bot answer original",
             baseline=False,
             event_time="2026-09-05T12:00:00Z",
             source_kind="issue_comment",
@@ -507,7 +507,7 @@ class BridgeTest(unittest.TestCase):
         )
         self.github.responses["/repos/owner/repo/issues/comments/41"] = {
             "id": 41,
-            "body": "@rnwst-bot answer edited instruction",
+            "body": "@test-bot answer edited instruction",
             "user": {"id": 100},
         }
         self.instance.process_pending_events()
@@ -527,14 +527,14 @@ class BridgeTest(unittest.TestCase):
             "comment:42",
             value,
             "100",
-            "@rnwst-bot implement original",
+            "@test-bot implement original",
             baseline=False,
             source_kind="issue_comment",
             source_id="42",
         )
         self.github.responses["/repos/owner/repo/issues/comments/42"] = {
             "id": 42,
-            "body": "@rnwst-bot answer changed",
+            "body": "@test-bot answer changed",
             "user": {"id": 100},
         }
         self.instance.process_pending_events()
@@ -551,7 +551,7 @@ class BridgeTest(unittest.TestCase):
             "comment:43",
             value,
             "100",
-            "@rnwst-bot implement",
+            "@test-bot implement",
             baseline=False,
             source_kind="issue_comment",
             source_id="43",
@@ -572,7 +572,7 @@ class BridgeTest(unittest.TestCase):
             "comment:44",
             value,
             "100",
-            "@rnwst-bot answer original",
+            "@test-bot answer original",
             baseline=False,
         )
         self.database.update_event("comment:44", "delivered")
@@ -580,7 +580,7 @@ class BridgeTest(unittest.TestCase):
             "comment:44",
             value,
             "100",
-            "@rnwst-bot implement edited too late",
+            "@test-bot implement edited too late",
             baseline=False,
         )
         event = self.database.event("comment:44")
@@ -595,7 +595,7 @@ class BridgeTest(unittest.TestCase):
         )
         self.assertEqual(self.database.event_state("comment:45"), "ignored")
         self.instance.consider_mention(
-            "comment:45", value, "100", "@rnwst-bot answer now", baseline=False
+            "comment:45", value, "100", "@test-bot answer now", baseline=False
         )
         event = self.database.event("comment:45")
         self.assertEqual(event["state"], "pending")
@@ -618,7 +618,7 @@ class BridgeTest(unittest.TestCase):
             "comment:old",
             value,
             "100",
-            "@rnwst-bot implement",
+            "@test-bot implement",
             baseline=False,
             event_time="2026-09-02T11:54:00Z",
         )
@@ -636,7 +636,7 @@ class BridgeTest(unittest.TestCase):
             "comment:delayed",
             value,
             "100",
-            "@rnwst-bot implement",
+            "@test-bot implement",
             baseline=False,
             event_time="2026-09-02T11:59:59Z",
         )
@@ -1082,7 +1082,7 @@ class BridgeTest(unittest.TestCase):
             "comment:90",
             value,
             "100",
-            "@rnwst-bot continue original",
+            "@test-bot continue original",
             baseline=False,
             source_kind="issue_comment",
             source_id="90",
@@ -1100,13 +1100,13 @@ class BridgeTest(unittest.TestCase):
             "comment:90",
             value,
             "100",
-            "@rnwst-bot continue edited",
+            "@test-bot continue edited",
             baseline=False,
             source_kind="issue_comment",
             source_id="90",
         )
         self.github.responses["/repos/owner/repo/issues/comments/90"]["body"] = (
-            "@rnwst-bot continue edited"
+            "@test-bot continue edited"
         )
         self.instance.process_pending_events()
         self.instance.dispatch_pending()
@@ -1247,7 +1247,7 @@ class BridgeTest(unittest.TestCase):
                                         "nodes": [
                                             {
                                                 "id": "DCR_1",
-                                                "body": "@rnwst-bot answer",
+                                                "body": "@test-bot answer",
                                                 "createdAt": "2026-09-02T00:00:01Z",
                                                 "updatedAt": "2026-09-02T00:00:01Z",
                                                 "author": {"databaseId": 100},

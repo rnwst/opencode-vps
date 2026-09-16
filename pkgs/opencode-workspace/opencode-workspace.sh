@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-bot_user=rnwst-bot
+bot_user=${OPENCODE_BOT_USER:?}
 bot_group=agent-workspaces
-admin_user=rnwst-admin
+admin_user=${OPENCODE_ADMIN_USER:?}
 workspaces_root=${OPENCODE_WORKSPACES_ROOT:?}
 tasks_root="$workspaces_root/.tasks"
 workspaces_tmp_root=${OPENCODE_WORKSPACES_TMP_ROOT:?}

@@ -6,6 +6,7 @@
   ...
 }:
 let
+  botHome = "/home/${settings.accounts.bot.name}";
   previewCfg = import ../config/previews.nix { inherit lib settings; };
   managedConfig = pkgs.writeText "opencode-managed.json" (
     builtins.toJSON {
@@ -75,7 +76,11 @@ let
     }
   );
 
-  agentsFile = ../config/AGENTS.md;
+  agentsFile = pkgs.writeText "opencode-AGENTS.md" (
+    builtins.replaceStrings [ "@GITHUB_REVIEWER@" ] [ "@${settings.githubReviewer}" ] (
+      builtins.readFile ../config/AGENTS.md
+    )
+  );
   tunnelEnabled = settings.cloudflareTunnelId != null;
 in
 {
@@ -110,18 +115,18 @@ in
       ];
 
       environment = {
-        HOME = "/home/rnwst-bot";
+        HOME = botHome;
         OPENCODE_DISABLE_PROJECT_CONFIG = "1";
         OPENCODE_DISABLE_LSP_DOWNLOAD = "true";
         OPENCODE_DISABLE_MODELS_FETCH = "false";
-        PATH = lib.mkForce "/etc/profiles/per-user/rnwst-bot/bin:/run/current-system/sw/bin";
-        XDG_CACHE_HOME = "/home/rnwst-bot/.cache";
-        XDG_CONFIG_HOME = "/home/rnwst-bot/.config";
-        XDG_DATA_HOME = "/home/rnwst-bot/.local/share";
+        PATH = lib.mkForce "/etc/profiles/per-user/${settings.accounts.bot.name}/bin:/run/current-system/sw/bin";
+        XDG_CACHE_HOME = "${botHome}/.cache";
+        XDG_CONFIG_HOME = "${botHome}/.config";
+        XDG_DATA_HOME = "${botHome}/.local/share";
       };
 
       serviceConfig = {
-        User = "rnwst-bot";
+        User = settings.accounts.bot.name;
         Group = "agent-workspaces";
         WorkingDirectory = settings.workspacesRoot;
         ExecStart = "${localPackages.opencode-server}/bin/opencode-server";
@@ -142,7 +147,7 @@ in
         ProtectKernelModules = true;
         ProtectSystem = "strict";
         ReadWritePaths = [
-          "/home/rnwst-bot"
+          botHome
           "/var/lib/ci-runner/jobs"
           settings.workspacesRoot
           settings.workspacesTmpRoot

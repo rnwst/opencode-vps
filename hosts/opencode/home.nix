@@ -1,18 +1,15 @@
-{ pkgs, ... }:
+{ pkgs, settings, ... }:
 {
   imports = [ ./development-home.nix ];
 
   home = {
-    username = "rnwst-bot";
-    homeDirectory = "/home/rnwst-bot";
+    username = settings.accounts.bot.name;
+    homeDirectory = "/home/${settings.accounts.bot.name}";
     stateVersion = "26.05";
   };
 
   programs.git.settings = {
-    user = {
-      name = "rnwst-bot";
-      email = "rnwst-bot@users.noreply.github.com";
-    };
+    user = settings.accounts.bot.git;
     credential."https://github.com".helper = "!${pkgs.gh}/bin/gh auth git-credential";
     url."https://github.com/" = {
       insteadOf = [

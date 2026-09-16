@@ -35,11 +35,11 @@ in
       requires = [ "opencode-workspace-temp-init.service" ];
       wants = [ "network-online.target" ];
       environment = {
-        HOME = "/home/rnwst-bot";
-        PATH = lib.mkForce "/etc/profiles/per-user/rnwst-bot/bin:/run/current-system/sw/bin";
+        HOME = "/home/${settings.accounts.bot.name}";
+        PATH = lib.mkForce "/etc/profiles/per-user/${settings.accounts.bot.name}/bin:/run/current-system/sw/bin";
       };
       serviceConfig = {
-        User = "rnwst-bot";
+        User = settings.accounts.bot.name;
         Group = "agent-workspaces";
         WorkingDirectory = settings.workspacesRoot;
         ExecStart = "${localPackages.opencode-preview}/bin/opencode-preview-server";

@@ -25,8 +25,9 @@ async function harness({ sessions = family(), get, stopExit = Promise.resolve(0)
   const requests = []
   const context = createContext({
     Bun: {
-      resolveSync(name) {
+      resolveSync(name, configDirectory) {
         assert.equal(name, "@opencode-ai/plugin")
+        assert.equal(configDirectory, process.env.OPENCODE_CONFIG_DIR)
         return "mock:plugin"
       },
       sleep() { throw new Error("Unexpected managed-response polling") },
