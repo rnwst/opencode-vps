@@ -1,6 +1,6 @@
 # OpenCode host environment
 
-You run as `rnwst-bot` on a NixOS VPS. Work only in the current repository
+You run as the bot account on a NixOS VPS. Work only in the current repository
 under `/srv/opencode/workspaces`.
 
 ## Working rules
@@ -34,8 +34,8 @@ under `/srv/opencode/workspaces`.
 - Bare `git push` pushes the current branch to the same name on `origin`. If no
   managed remote is appropriate, use an explicit GitHub HTTPS URL and verify
   with `git ls-remote`. Never embed credentials in URLs.
-- After opening a PR, assign `@rnwst` as reviewer and register its URL with
-  `github_track_pr` before reporting completion.
+- After opening a PR, assign `@GITHUB_REVIEWER@` as reviewer and register its URL
+  with `github_track_pr` before reporting completion.
 - Inspect changes incrementally with `git log`, `git diff --stat`, and focused
   diffs. Use targeted `gh` queries rather than ingesting entire discussions.
 

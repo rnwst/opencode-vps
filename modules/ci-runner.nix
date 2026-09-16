@@ -1,6 +1,7 @@
 {
   lib,
   localPackages,
+  settings,
   ...
 }:
 {
@@ -16,7 +17,7 @@
 
   security.sudo.extraRules = [
     {
-      users = [ "rnwst-bot" ];
+      users = [ settings.accounts.bot.name ];
       runAs = "ci-runner";
       commands = [
         {

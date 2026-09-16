@@ -5,6 +5,7 @@
 }:
 let
   inherit (pkgs) julia;
+  botHome = "/home/${settings.accounts.bot.name}";
   opencode = import ./opencode.nix { inherit pkgsUnstable; };
   playwright-mcp = import ./playwright-mcp.nix { inherit pkgs; };
   previewCfg = import ../config/previews.nix {
@@ -143,11 +144,11 @@ let
       credential_helper='!f() { if [ "$1" = get ]; then printf "%s\n" "username=x-access-token" "password=$OPENCODE_GITHUB_TOKEN"; fi; }; f'
 
       cd ${settings.workspacesRoot}
-      exec runuser --user rnwst-bot -- env \
+      exec runuser --user ${pkgs.lib.escapeShellArg settings.accounts.bot.name} -- env \
         GIT_TERMINAL_PROMPT=0 \
-        HOME=/home/rnwst-bot \
+        HOME=${pkgs.lib.escapeShellArg botHome} \
         OPENCODE_GITHUB_TOKEN="$token" \
-        XDG_CONFIG_HOME=/home/rnwst-bot/.config \
+        XDG_CONFIG_HOME=${pkgs.lib.escapeShellArg "${botHome}/.config"} \
         ${pkgs.git}/bin/git \
         -c credential.https://github.com.helper= \
         -c credential.https://github.com.helper="$credential_helper" \
@@ -517,7 +518,7 @@ let
     import { readFile, rename, rm, unlink, writeFile } from "node:fs/promises"
 
     const { tool } = await import(
-      Bun.resolveSync("@opencode-ai/plugin", "/home/rnwst-bot/.config/opencode"),
+      Bun.resolveSync("@opencode-ai/plugin", ${builtins.toJSON "${botHome}/.config/opencode"}),
     )
 
     export const ManagedHost = async ({ directory, client }) => {

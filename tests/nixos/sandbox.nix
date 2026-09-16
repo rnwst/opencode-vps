@@ -1,6 +1,26 @@
-{ localPackages, pkgs }:
+{ pkgs, pkgsUnstable }:
 let
-  settings = import ../../hosts/opencode/settings.nix;
+  settings = (import ../../hosts/opencode/settings.nix) // {
+    accounts = {
+      bot = {
+        name = "test-bot";
+        git = {
+          name = "Test Bot";
+          email = "test-bot@example.com";
+        };
+      };
+      admin = {
+        name = "test-admin";
+        git = {
+          name = "Test Admin";
+          email = "test-admin@example.com";
+        };
+      };
+    };
+    githubReviewer = "test-reviewer";
+  };
+  localPackages = import ../../pkgs { inherit pkgs pkgsUnstable settings; };
+  botHome = "/home/${settings.accounts.bot.name}";
   # A real task-length path must not overflow Linux's Unix socket pathname limit.
   name = ".tasks/task-security-long-workspace-name-0123456789abcdef";
   workspace = "${settings.workspacesRoot}/${name}";
@@ -22,10 +42,10 @@ pkgs.testers.nixosTest {
       "10.55.0.1" = [ "private.github.com" ];
     };
     users.groups.agent-workspaces = { };
-    users.users.rnwst-bot = {
+    users.users.${settings.accounts.bot.name} = {
       isSystemUser = true;
       group = "agent-workspaces";
-      home = "/home/rnwst-bot";
+      home = botHome;
       createHome = true;
     };
     environment.systemPackages = with pkgs; [
@@ -42,8 +62,8 @@ pkgs.testers.nixosTest {
       ];
       preStart = ''
         install -d -m 0711 ${settings.workspacesRoot} ${settings.workspacesTmpRoot}
-        install -d -m 0700 -o rnwst-bot -g agent-workspaces ${workspace} ${temporary}
-        setfacl -m u:rnwst-bot:rwx,d:u:rnwst-bot:rwx ${workspace} ${temporary}
+        install -d -m 0700 -o ${settings.accounts.bot.name} -g agent-workspaces ${workspace} ${temporary}
+        setfacl -m u:${settings.accounts.bot.name}:rwx,d:u:${settings.accounts.bot.name}:rwx ${workspace} ${temporary}
         install -d -m 0755 /run/sandbox-fixture
         install -d -m 0700 /run/sandbox-fixture/private
         openssl rand -hex 24 > /run/sandbox-fixture/private/token
@@ -71,7 +91,7 @@ pkgs.testers.nixosTest {
         python3
       ];
       environment = {
-        HOME = "/home/rnwst-bot";
+        HOME = botHome;
         NODE_EXTRA_CA_CERTS = "/run/sandbox-fixture/ca.crt";
       };
       # Keep the sandbox-relevant hardening in modules/opencode.nix, without
@@ -80,7 +100,7 @@ pkgs.testers.nixosTest {
         Type = "oneshot";
         RemainAfterExit = true;
         TimeoutStartSec = 180;
-        User = "rnwst-bot";
+        User = settings.accounts.bot.name;
         Group = "agent-workspaces";
         WorkingDirectory = workspace;
         LoadCredential = [ "github-token:/run/sandbox-fixture/private/token" ];
@@ -93,7 +113,7 @@ pkgs.testers.nixosTest {
         ProtectKernelModules = true;
         ProtectSystem = "strict";
         ReadWritePaths = [
-          "/home/rnwst-bot"
+          botHome
           settings.workspacesRoot
           settings.workspacesTmpRoot
         ];
@@ -144,7 +164,7 @@ pkgs.testers.nixosTest {
     assert sorted(events) == sorted(["github.com authenticated", "api.github.com authenticated"]), events
     # A nonzero workload exit must also remove its per-call broker directory.
     command = "cd ${workspace} && OPENCODE_SESSION_ID=ses_error ${wrapper} -c 'exit 23'"
-    status, _ = machine.execute("runuser -u rnwst-bot -- sh -c " + shlex.quote(command))
+    status, _ = machine.execute("runuser -u ${settings.accounts.bot.name} -- sh -c " + shlex.quote(command))
     assert status == 23, status
     machine.succeed("${python} verify ${workspace} ${temporary}")
   '';

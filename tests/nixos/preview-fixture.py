@@ -253,12 +253,12 @@ def integration(wrapper, config_path, task):
         result = subprocess.run(
             [wrapper, *args],
             cwd=root / workspace,
-            user="rnwst-bot",
+            user="test-bot",
             group="agent-workspaces",
             extra_groups=[],
             env={
                 **os.environ,
-                "HOME": "/home/rnwst-bot",
+                "HOME": "/home/test-bot",
                 "OPENCODE_SESSION_ID": session,
             },
             capture_output=True,
@@ -289,12 +289,12 @@ def integration(wrapper, config_path, task):
         process = subprocess.Popen(
             [wrapper, "-c", "exec python3 -c " + shlex.quote(program)],
             cwd=root / "alpha",
-            user="rnwst-bot",
+            user="test-bot",
             group="agent-workspaces",
             extra_groups=[],
             env={
                 **os.environ,
-                "HOME": "/home/rnwst-bot",
+                "HOME": "/home/test-bot",
                 "OPENCODE_SESSION_ID": "ses_alpha",
             },
             stdout=subprocess.PIPE,
@@ -355,12 +355,12 @@ def integration(wrapper, config_path, task):
         process = await asyncio.create_subprocess_exec(
             str(Path(wrapper).with_name("opencode-session-mcp")),
             cwd=root / "alpha",
-            user="rnwst-bot",
+            user="test-bot",
             group="agent-workspaces",
             extra_groups=[],
             env={
                 **os.environ,
-                "HOME": "/home/rnwst-bot",
+                "HOME": "/home/test-bot",
                 # Routing must use the trusted per-call metadata, not this env.
                 "OPENCODE_SESSION_ID": "ses_other",
             },

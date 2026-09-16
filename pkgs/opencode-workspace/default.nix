@@ -20,6 +20,8 @@ pkgs.writeShellApplication {
     util-linux
   ];
   text = ''
+    export OPENCODE_BOT_USER=${pkgs.lib.escapeShellArg settings.accounts.bot.name}
+    export OPENCODE_ADMIN_USER=${pkgs.lib.escapeShellArg settings.accounts.admin.name}
     export OPENCODE_WORKSPACES_ROOT=${settings.workspacesRoot}
     export OPENCODE_WORKSPACES_TMP_ROOT=${settings.workspacesTmpRoot}
     export OPENCODE_CANONICAL_ROOT=${settings.githubBridge.canonicalRoot}

@@ -3,8 +3,8 @@
   imports = [ ./development-home.nix ];
 
   home = {
-    username = "rnwst-admin";
-    homeDirectory = "/home/rnwst-admin";
+    username = settings.accounts.admin.name;
+    homeDirectory = "/home/${settings.accounts.admin.name}";
     stateVersion = "26.05";
   };
 
@@ -51,6 +51,9 @@
         og = "sudo opencode-git";
       };
     };
-    git.settings.safe.directory = "${settings.workspacesRoot}/*";
+    git.settings = {
+      user = settings.accounts.admin.git;
+      safe.directory = "${settings.workspacesRoot}/*";
+    };
   };
 }

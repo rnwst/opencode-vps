@@ -22,6 +22,10 @@
 
   assertions = [
     {
+      assertion = settings.accounts.admin.name != settings.accounts.bot.name;
+      message = "The administrator and bot must use distinct account names.";
+    }
+    {
       assertion = settings.operatorKeys != [ ];
       message = "Configure settings.operatorKeys with at least one SSH public key before deployment.";
     }
@@ -102,7 +106,7 @@
     users = {
       root.hashedPassword = "!";
 
-      rnwst-admin = {
+      ${settings.accounts.admin.name} = {
         isNormalUser = true;
         description = "OpenCode host administrator";
         shell = localPackages.fish;
@@ -113,7 +117,7 @@
         openssh.authorizedKeys.keys = settings.operatorKeys;
       };
 
-      rnwst-bot = {
+      ${settings.accounts.bot.name} = {
         isNormalUser = true;
         description = "OpenCode agent account";
         shell = localPackages.fish;
@@ -142,8 +146,8 @@
       PasswordAuthentication = false;
       KbdInteractiveAuthentication = false;
       AllowUsers = [
-        "rnwst-admin"
-        "rnwst-bot"
+        settings.accounts.admin.name
+        settings.accounts.bot.name
       ];
     };
   };
@@ -154,9 +158,9 @@
   };
 
   systemd.tmpfiles.rules = [
-    "d ${settings.workspacesRoot} 2750 rnwst-bot agent-workspaces -"
-    "a+ ${settings.workspacesRoot} - - - - u:rnwst-admin:rwx,u:rnwst-bot:rwx,g::r-x,m::rwx,o::---,d:u::rwx,d:u:rnwst-admin:rwx,d:u:rnwst-bot:rwx,d:g::r-x,d:m::rwx,d:o::---"
-    "a+ /home/rnwst-bot - - - - u:rnwst-admin:rwx,d:u::rwx,d:u:rnwst-admin:rwx,d:u:rnwst-bot:rwx,d:g::---,d:m::rwx,d:o::---"
+    "d ${settings.workspacesRoot} 2750 ${settings.accounts.bot.name} agent-workspaces -"
+    "a+ ${settings.workspacesRoot} - - - - u:${settings.accounts.admin.name}:rwx,u:${settings.accounts.bot.name}:rwx,g::r-x,m::rwx,o::---,d:u::rwx,d:u:${settings.accounts.admin.name}:rwx,d:u:${settings.accounts.bot.name}:rwx,d:g::r-x,d:m::rwx,d:o::---"
+    "a+ /home/${settings.accounts.bot.name} - - - - u:${settings.accounts.admin.name}:rwx,d:u::rwx,d:u:${settings.accounts.admin.name}:rwx,d:u:${settings.accounts.bot.name}:rwx,d:g::---,d:m::rwx,d:o::---"
     "d /var/lib/ci-runner/jobs 0700 ci-runner users 1d"
     "d ${settings.secrets.directory} 0700 root root -"
   ];
@@ -174,8 +178,8 @@
     extraSpecialArgs = {
       inherit inputs localPackages settings;
     };
-    users.rnwst-bot = import ./home.nix;
-    users.rnwst-admin = import ./admin-home.nix;
+    users.${settings.accounts.bot.name} = import ./home.nix;
+    users.${settings.accounts.admin.name} = import ./admin-home.nix;
   };
 
   system.stateVersion = "26.05";

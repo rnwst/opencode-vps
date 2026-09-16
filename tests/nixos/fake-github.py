@@ -124,7 +124,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     ["git", "clone", "--bare", str(ROOT / "repo.git"), str(remote)],
                     check=True,
                 )
-                uid = pwd.getpwnam("rnwst-bot").pw_uid
+                uid = pwd.getpwnam("test-bot").pw_uid
                 gid = grp.getgrnam("agent-workspaces").gr_gid
                 for root, directories, files in os.walk(remote):
                     os.chown(root, uid, gid)
@@ -149,7 +149,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         remote = ROOT / f"{name}.git"
         if not remote.exists():
             subprocess.run(["git", "init", "--bare", str(remote)], check=True)
-            uid = pwd.getpwnam("rnwst-bot").pw_uid
+            uid = pwd.getpwnam("test-bot").pw_uid
             gid = grp.getgrnam("agent-workspaces").gr_gid
             for root, directories, files in os.walk(remote):
                 os.chown(root, uid, gid)

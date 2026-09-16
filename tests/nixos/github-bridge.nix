@@ -1,6 +1,6 @@
 {
-  localPackages,
   pkgs,
+  pkgsUnstable,
 }:
 let
   fakeGitHub = pkgs.writeText "fake-github.py" (builtins.readFile ./fake-github.py);
@@ -28,6 +28,23 @@ let
     }
   '';
   testSettings = {
+    accounts = {
+      bot = {
+        name = "test-bot";
+        git = {
+          name = "Test Bot";
+          email = "test-bot@example.com";
+        };
+      };
+      admin = {
+        name = "test-admin";
+        git = {
+          name = "Test Admin";
+          email = "test-admin@example.com";
+        };
+      };
+    };
+    githubReviewer = "test-reviewer";
     opencodePort = 4096;
     workspacesRoot = "/srv/opencode/workspaces";
     workspacesTmpRoot = "/srv/opencode/workspace-tmp";
@@ -50,6 +67,11 @@ let
       serverPassword = "/var/lib/opencode-secrets/server-password";
       githubControllerId = "/var/lib/opencode-secrets/github-controller-id";
     };
+  };
+  botHome = "/home/${testSettings.accounts.bot.name}";
+  localPackages = import ../../pkgs {
+    inherit pkgs pkgsUnstable;
+    settings = testSettings;
   };
   testWorkspace = import ../../pkgs/opencode-workspace {
     inherit pkgs;
@@ -85,14 +107,16 @@ pkgs.testers.nixosTest {
       users = {
         groups.agent-workspaces = { };
         users = {
-          rnwst-admin = {
+          ${testSettings.accounts.admin.name} = {
             isSystemUser = true;
             group = "agent-workspaces";
+            home = "/home/${testSettings.accounts.admin.name}";
+            createHome = true;
           };
-          rnwst-bot = {
+          ${testSettings.accounts.bot.name} = {
             isSystemUser = true;
             group = "agent-workspaces";
-            home = "/var/lib/rnwst-bot";
+            home = botHome;
             createHome = true;
           };
         };
@@ -112,7 +136,7 @@ pkgs.testers.nixosTest {
           description = "OpenCode integration-test server";
           wantedBy = [ "multi-user.target" ];
           environment = {
-            HOME = "/var/lib/rnwst-bot";
+            HOME = botHome;
             OPENCODE_CONFIG_CONTENT = builtins.toJSON {
               autoupdate = false;
               permission = {
@@ -131,23 +155,23 @@ pkgs.testers.nixosTest {
             OPENCODE_DISABLE_DEFAULT_PLUGINS = "true";
             OPENCODE_DISABLE_PROJECT_CONFIG = "1";
             OPENCODE_SERVER_PASSWORD = "test-password";
-            XDG_CACHE_HOME = "/var/lib/rnwst-bot/.cache";
-            XDG_CONFIG_HOME = "/var/lib/rnwst-bot/.config";
-            XDG_DATA_HOME = "/var/lib/rnwst-bot/.local/share";
+            XDG_CACHE_HOME = "${botHome}/.cache";
+            XDG_CONFIG_HOME = "${botHome}/.config";
+            XDG_DATA_HOME = "${botHome}/.local/share";
           };
           serviceConfig = {
-            User = "rnwst-bot";
+            User = testSettings.accounts.bot.name;
             Group = "agent-workspaces";
             ExecStart = "${testLocalPackages.opencode}/bin/opencode serve --hostname 127.0.0.1 --port 4096";
             Restart = "on-failure";
           };
           preStart = ''
-            install -d -m 0750 /var/lib/rnwst-bot/.config/opencode/node_modules
+            install -d -m 0750 ${botHome}/.config/opencode/node_modules
             printf '%s\n' '${
               builtins.toJSON {
                 packages."".dependencies."@opencode-ai/plugin" = testLocalPackages.opencode.version;
               }
-            }' > /var/lib/rnwst-bot/.config/opencode/package-lock.json
+            }' > ${botHome}/.config/opencode/package-lock.json
           '';
         };
 
@@ -213,7 +237,7 @@ pkgs.testers.nixosTest {
     machine.succeed(f"{workspace_env} opencode-workspace create owner/repo cloned-one")
     machine.succeed("test $(cat /srv/opencode/workspaces/cloned-one/version) = first")
     machine.succeed(
-      "runuser -u rnwst-bot -- bash -c 'cd /srv/opencode/workspaces/cloned-one && "
+      "runuser -u ${testSettings.accounts.bot.name} -- bash -c 'cd /srv/opencode/workspaces/cloned-one && "
       "opencode-sandbox-exec -c \"test ! -r /var/lib/opencode-task-bases/738/version\"'"
     )
 
@@ -231,7 +255,7 @@ pkgs.testers.nixosTest {
     )
     machine.succeed("jq -e '.repository_id == \"738\"' /tmp/fork-task.json")
     machine.succeed(
-      "test $(runuser -u rnwst-bot -- git -C "
+      "test $(runuser -u ${testSettings.accounts.bot.name} -- git -C "
       "/srv/opencode/workspaces/.tasks/task-bbbbbbbbbbbbbbbb remote get-url origin) "
       "= https://github.com/bot/repo.git"
     )
@@ -241,12 +265,12 @@ pkgs.testers.nixosTest {
 
     machine.succeed("opencode-workspace init alpha")
     machine.succeed(
-      "runuser -u rnwst-bot -- env OPENCODE_SESSION_ID=ses_one bash -c "
+      "runuser -u ${testSettings.accounts.bot.name} -- env OPENCODE_SESSION_ID=ses_one bash -c "
       "'cd /srv/opencode/workspaces/alpha && opencode-sandbox-exec -c "
       "\"touch /tmp/one; test ! -r /srv/opencode/workspace-tmp/alpha/ses_two\"'"
     )
     machine.succeed(
-      "runuser -u rnwst-bot -- env OPENCODE_SESSION_ID=ses_two bash -c "
+      "runuser -u ${testSettings.accounts.bot.name} -- env OPENCODE_SESSION_ID=ses_two bash -c "
       "'cd /srv/opencode/workspaces/alpha && opencode-sandbox-exec -c "
       "\"test ! -e /tmp/one; touch /tmp/two; "
       "test ! -r /srv/opencode/workspace-tmp/alpha/ses_one/one\"'"
@@ -263,10 +287,10 @@ pkgs.testers.nixosTest {
     machine.fail("test -e /srv/opencode/workspaces/alpha/changed")
     machine.succeed("test -e /srv/opencode/workspaces/beta/original")
     machine.fail(
-      "runuser -u rnwst-bot -- bash -c 'cd /srv/opencode/workspaces && opencode-sandbox-exec -c true'"
+      "runuser -u ${testSettings.accounts.bot.name} -- bash -c 'cd /srv/opencode/workspaces && opencode-sandbox-exec -c true'"
     )
     machine.succeed(
-      "runuser -u rnwst-bot -- bash -c 'cd /srv/opencode/workspaces/alpha && "
+      "runuser -u ${testSettings.accounts.bot.name} -- bash -c 'cd /srv/opencode/workspaces/alpha && "
       "opencode-sandbox-exec -c \"test ! -r ../beta/changed\"'"
     )
     machine.succeed("mkdir -p /srv/opencode/workspaces/.tasks/task-aaaaaaaaaaaaaaaa")
@@ -278,13 +302,13 @@ pkgs.testers.nixosTest {
     machine.succeed("opencode-workspace init local-project")
     machine.succeed(f"{workspace_env} opencode-workspace set-remote local-project owner/repo")
     machine.succeed(
-      "test $(runuser -u rnwst-bot -- git -C /srv/opencode/workspaces/local-project remote get-url origin) "
+      "test $(runuser -u ${testSettings.accounts.bot.name} -- git -C /srv/opencode/workspaces/local-project remote get-url origin) "
       "= file:///srv/git/repo.git"
     )
 
     machine.succeed("opencode-workspace init removable-project")
     machine.succeed(
-      "runuser -u rnwst-bot -- bash -c 'cd \"$1\"; exec \"$2\" -c \"$3\"' bash "
+      "runuser -u ${testSettings.accounts.bot.name} -- bash -c 'cd \"$1\"; exec \"$2\" -c \"$3\"' bash "
       "/srv/opencode/workspaces/removable-project opencode-sandbox-exec "
       "'test \"$TMPDIR\" = /tmp/claude; "
       "temporary=$(mktemp); test -f \"$temporary\"; rm \"$temporary\"'"
@@ -301,7 +325,7 @@ pkgs.testers.nixosTest {
 
     machine.succeed("opencode-workspace init force-project")
     machine.succeed(
-      "runuser -u rnwst-bot -- git -C /srv/opencode/workspaces/force-project "
+      "runuser -u ${testSettings.accounts.bot.name} -- git -C /srv/opencode/workspaces/force-project "
       "-c user.name=Test -c user.email=test@example.com commit --allow-empty -m local-only"
     )
     machine.fail("opencode-workspace remove force-project")
@@ -316,7 +340,7 @@ pkgs.testers.nixosTest {
     machine.fail("test -e /srv/opencode/workspace-tmp/dirty-force-project")
 
     machine.succeed("opencode-workspace init public-project")
-    machine.succeed("runuser -u rnwst-bot -- git -C /srv/opencode/workspaces/public-project -c user.name=Test -c user.email=test@example.com commit --allow-empty -m initial")
+    machine.succeed("runuser -u ${testSettings.accounts.bot.name} -- git -C /srv/opencode/workspaces/public-project -c user.name=Test -c user.email=test@example.com commit --allow-empty -m initial")
     machine.succeed(f"{workspace_env} opencode-workspace publish public-project owner/public-project")
     machine.succeed("git --git-dir=/srv/git/public-project.git rev-parse refs/heads/main")
     machine.succeed("opencode-workspace init private-project")

@@ -38,8 +38,8 @@ flake.
 | Base system    | NixOS 26.05, x86-64, GPT with BIOS and EFI boot, compressed Btrfs root, 25% zram            |
 | Public ingress | Existing Cloudflare Tunnel to preview gateway on `127.0.0.1:4080`, then OpenCode or session |
 | Host firewall  | TCP 22 only; gateway 4080 and OpenCode 4096 are loopback-only                               |
-| `rnwst-admin`  | Primary operator with passwordless sudo and the full development profile                    |
-| `rnwst-bot`    | OpenCode and workspace owner, SSH enabled, no general sudo                                  |
+| `<ADMIN_USER>` | Primary operator with passwordless sudo and the full development profile                    |
+| `<BOT_USER>`   | OpenCode and workspace owner, SSH enabled, no general sudo                                  |
 | `ci-runner`    | No credentials or login shell; rootless Docker and disposable `act` jobs                    |
 | OpenCode       | Pinned package, HTTP Basic Auth, OpenAI provider, sharing/snapshots/autoupdate disabled     |
 | Agent commands | Managed shell wrapper, Sandbox Runtime, bubblewrap, curated egress, worktree-only writes    |
@@ -188,10 +188,10 @@ Workspaces live in `/srv/opencode/workspaces` rather than the bot's home so
 project data is separate from private authentication, configuration, caches,
 and shell startup files. This lets the sandbox deny bot-home access and lets
 `ci-runner` read source through the `agent-workspaces` group without opening
-`/home/rnwst-bot`. It also leaves the workspace tree easy to mount, back up,
+`/home/<BOT_USER>`. It also leaves the workspace tree easy to mount, back up,
 or quota independently later.
 
-Named ACLs give `rnwst-admin` and `rnwst-bot` read/write access to workspaces,
+Named ACLs give `<ADMIN_USER>` and `<BOT_USER>` read/write access to workspaces,
 while the owning `agent-workspaces` group keeps `ci-runner` read-only. Admin
 also has read/write ACL access to the bot home for direct maintenance. This
 includes OpenCode state and ChatGPT OAuth credentials, so processes running as
@@ -211,7 +211,7 @@ history and working files share disk extents. Canonical repositories are fetched
 under a per-repository lock before every snapshot. Manual workspaces remain
 directly below `/srv/opencode/workspaces` and are never collected automatically.
 Automated names remain unique while identifying their GitHub subject, for
-example `task-rnwst-fish-helix-pr-6-5eeebd5902cc`. OpenCode clients use this
+example `task-example-project-pr-6-5eeebd5902cc`. OpenCode clients use this
 directory basename as the workspace label.
 
 ## Repository Layout
@@ -320,6 +320,32 @@ secret paths. Replace every template value before deployment. Keep site domains,
 tunnel IDs, and other installation-specific overrides local and unstaged; do not
 commit them. Deployment examples here use only placeholder domains and IDs.
 
+### Account Settings
+
+`hosts/opencode/settings.nix` centralizes deployment identities:
+
+| Setting | Meaning |
+| ------- | ------- |
+| `accounts.admin.name` | Administrator Unix username (`<ADMIN_USER>` below) |
+| `accounts.bot.name` | OpenCode Unix username (`<BOT_USER>` below) |
+| `accounts.admin.git = { name = "..."; email = "..."; };` | Administrator's Git commit identity |
+| `accounts.bot.git = { name = "..."; email = "..."; };` | Bot's Git commit identity |
+| `githubReviewer` | GitHub login to request as PR reviewer, not the bridge's authorization identity |
+
+Homes derive from the account names as `/home/<ADMIN_USER>` and
+`/home/<BOT_USER>`. Git identities are configured per user, not system-wide or
+by repository ownership; normal admin Git uses the admin identity, while agent
+Git and `opencode-git` use the bot identity. These are independent of the token's
+GitHub login (`<BOT_LOGIN>`), which the bridge discovers from the token.
+Replace all angle-bracket placeholders before running examples.
+
+Changing an existing username is not an automatic migration: plan migration of
+homes, file ownership, ACLs, and authentication state before switching. Tokens,
+the server password, and the controller's numeric GitHub ID remain runtime
+inputs under `settings.secrets`, not public identity settings (the numeric ID
+itself is not secret). Fish/Helix dependency sources and copyright attribution
+are not deployment identities and do not need renaming.
+
 ### Preview Settings
 
 `config/previews.nix` enables previews by default and merges `settings.previews`
@@ -388,7 +414,7 @@ Configure models in `hosts/opencode/settings.nix`:
 | `defaultModel` | `openai/gpt-6-astra-fast` |
 | `githubBridge.model` | `openai/gpt-6-astra` |
 
-List available IDs with `sudo -iu rnwst-bot opencode models` and rebuild after
+List available IDs with `sudo -iu <BOT_USER> opencode models` and rebuild after
 changing these settings. Explicit session selections take precedence over the
 OpenCode default. The bridge uses its configured model for each dispatch and
 leaves events pending if that model is unavailable.
@@ -401,7 +427,7 @@ a new conversation or browser reload. To reload them, wait for active agent work
 to finish, then run on the VPS:
 
 ```bash
-sudo -iu rnwst-bot opencode models --refresh
+sudo -iu <BOT_USER> opencode models --refresh
 sudo systemctl restart opencode.service
 ```
 
@@ -681,7 +707,7 @@ connect with the configured operator key:
 
 ```bash
 ssh-keygen -R <VPS_IP>
-ssh rnwst-admin@<VPS_IP>
+ssh <ADMIN_USER>@<VPS_IP>
 ```
 
 Inspect and commit the generated hardware configuration after a successful
@@ -701,11 +727,11 @@ scp bootstrap-secrets/server-password \
   bootstrap-secrets/github-token \
   bootstrap-secrets/github-controller-id \
   bootstrap-secrets/cloudflared.json \
-  rnwst-admin@<VPS_IP>:/tmp/
+  <ADMIN_USER>@<VPS_IP>:/tmp/
 ```
 
 ```bash
-ssh rnwst-admin@<VPS_IP>
+ssh <ADMIN_USER>@<VPS_IP>
 sudo install -d -m 0700 -o root -g root /var/lib/opencode-secrets
 sudo install -m 0400 -o root -g root /tmp/server-password /var/lib/opencode-secrets/server-password
 sudo install -m 0400 -o root -g root /tmp/github-token /var/lib/opencode-secrets/github-token
@@ -727,7 +753,7 @@ retired key files after deploying this revision:
 ```bash
 sudo rm -f \
   /var/lib/opencode-secrets/github-bot-ed25519 \
-  /home/rnwst-bot/.ssh/id_ed25519_github
+  /home/<BOT_USER>/.ssh/id_ed25519_github
 ```
 
 On the operator workstation:
@@ -743,7 +769,7 @@ to log in to the VPS.
 ## 7. Connect ChatGPT Pro
 
 OpenCode stores provider OAuth state in
-`/home/rnwst-bot/.local/share/opencode/auth.json`. It is not Nix-managed and
+`/home/<BOT_USER>/.local/share/opencode/auth.json`. It is not Nix-managed and
 the command sandbox cannot read it.
 
 Use OpenCode's headless device flow; it does not require port forwarding.
@@ -751,14 +777,14 @@ Connect to the VPS normally, stop the server, and run login from the bot's
 login environment:
 
 ```bash
-ssh rnwst-admin@<VPS_IP>
+ssh <ADMIN_USER>@<VPS_IP>
 ```
 
 On the VPS:
 
 ```bash
 sudo systemctl stop opencode
-sudo -iu rnwst-bot opencode auth login \
+sudo -iu <BOT_USER> opencode auth login \
   --provider openai \
   --method 'ChatGPT Pro/Plus (headless)'
 sudo systemctl start opencode
@@ -813,7 +839,7 @@ sudo opencode-git ls-remote \
   https://github.com/<OWNER>/<REPOSITORY>.git HEAD
 ```
 
-`opencode-git` starts in `/srv/opencode/workspaces`, runs Git as `rnwst-bot`,
+`opencode-git` starts in `/srv/opencode/workspaces`, runs Git as `<BOT_USER>`,
 and supplies the root-owned token through an ephemeral HTTPS credential helper.
 It never stores the token in Git configuration or a remote URL. In the admin
 Fish shell, `og` abbreviates `sudo opencode-git`; normal `git` remains unchanged.
@@ -822,14 +848,14 @@ Verify the token without placing it in shell history or process arguments:
 
 ```bash
 sudo systemd-run --wait --pipe --collect \
-  --uid=rnwst-bot \
+  --uid=<BOT_USER> \
   --gid=agent-workspaces \
   --property=LoadCredential=github-token:/var/lib/opencode-secrets/github-token \
   /run/current-system/sw/bin/bash -c '
     GH_TOKEN=$(< "$CREDENTIALS_DIRECTORY/github-token")
     export GH_TOKEN
-    /etc/profiles/per-user/rnwst-bot/bin/gh auth status
-    /etc/profiles/per-user/rnwst-bot/bin/gh api user --jq .login
+    /etc/profiles/per-user/<BOT_USER>/bin/gh auth status
+    /etc/profiles/per-user/<BOT_USER>/bin/gh api user --jq .login
   '
 ```
 
@@ -864,12 +890,15 @@ text are. Additional instruction text is optional, and multiple commands in one
 comment are rejected as ambiguous:
 
 ```text
-@rnwst-bot answer [additional instruction]
-@rnwst-bot implement [additional instruction]
-@rnwst-bot review [additional instruction]
-@rnwst-bot continue [additional instruction]
-@rnwst-bot cancel
+@<BOT_LOGIN> answer [additional instruction]
+@<BOT_LOGIN> implement [additional instruction]
+@<BOT_LOGIN> review [additional instruction]
+@<BOT_LOGIN> continue [additional instruction]
+@<BOT_LOGIN> cancel
 ```
+
+Use the token's GitHub login for `<BOT_LOGIN>`, not the Unix `<BOT_USER>`;
+`gh api user --jq .login` above verifies it.
 
 | Command     | Issue                             | Pull request                                            | Discussion                               |
 | ----------- | --------------------------------- | ------------------------------------------------------- | ---------------------------------------- |
@@ -947,8 +976,8 @@ No separate automation reacts to failed checks or merge conflicts. Agents run
 back to the mapped session explicitly:
 
 ```text
-@rnwst-bot continue Fix the failing remote checks.
-@rnwst-bot continue Rebase this branch and resolve the conflicts.
+@<BOT_LOGIN> continue Fix the failing remote checks.
+@<BOT_LOGIN> continue Rebase this branch and resolve the conflicts.
 ```
 
 ## Clients And Sessions
@@ -1046,7 +1075,7 @@ entry to stop. An operator can stop it with the exact session ID and workspace
 root path:
 
 ```bash
-sudo -u rnwst-bot opencode-session-exec stop \
+sudo -u <BOT_USER> opencode-session-exec stop \
   --session ses_EXAMPLE \
   --directory /srv/opencode/workspaces/my-project
 ```
@@ -1222,13 +1251,13 @@ From a non-NixOS workstation, stage the secret-free checkout and rebuild as
 root on the VPS:
 
 ```bash
-ssh rnwst-admin@<VPS_IP> \
-  'rm -rf /tmp/rnwst-bot && mkdir -m 0700 /tmp/rnwst-bot'
+ssh <ADMIN_USER>@<VPS_IP> \
+  'rm -rf /tmp/opencode-config && mkdir -m 0700 /tmp/opencode-config'
 rsync --archive \
   .gitignore README.md flake.lock flake.nix config hosts modules pkgs tests \
-  rnwst-admin@<VPS_IP>:/tmp/rnwst-bot/
-ssh rnwst-admin@<VPS_IP> \
-  'sudo nixos-rebuild switch --flake /tmp/rnwst-bot#opencode'
+  <ADMIN_USER>@<VPS_IP>:/tmp/opencode-config/
+ssh <ADMIN_USER>@<VPS_IP> \
+  'sudo nixos-rebuild switch --flake /tmp/opencode-config#opencode'
 ```
 
 After first deploying the shared-access ACLs, migrate existing files and add
@@ -1236,22 +1265,22 @@ inherited defaults to existing directories:
 
 ```bash
 sudo setfacl -R -m \
-  'u:rnwst-admin:rwX,u:rnwst-bot:rwX,g::r-X,m::rwx,o::---' \
+  'u:<ADMIN_USER>:rwX,u:<BOT_USER>:rwX,g::r-X,m::rwx,o::---' \
   /srv/opencode/workspaces
 sudo find /srv/opencode/workspaces -type d -exec setfacl -m \
-  'd:u::rwx,d:u:rnwst-admin:rwx,d:u:rnwst-bot:rwx,d:g::r-x,d:m::rwx,d:o::---' \
+  'd:u::rwx,d:u:<ADMIN_USER>:rwx,d:u:<BOT_USER>:rwx,d:g::r-x,d:m::rwx,d:o::---' \
   {} +
 
 sudo setfacl -R -m \
-  'u:rnwst-admin:rwX,u:rnwst-bot:rwX,m::rwx' \
-  /home/rnwst-bot
-sudo find /home/rnwst-bot -type d -exec setfacl -m \
-  'd:u::rwx,d:u:rnwst-admin:rwx,d:u:rnwst-bot:rwx,d:g::---,d:m::rwx,d:o::---' \
+  'u:<ADMIN_USER>:rwX,u:<BOT_USER>:rwX,m::rwx' \
+  /home/<BOT_USER>
+sudo find /home/<BOT_USER> -type d -exec setfacl -m \
+  'd:u::rwx,d:u:<ADMIN_USER>:rwx,d:u:<BOT_USER>:rwx,d:g::---,d:m::rwx,d:o::---' \
   {} +
 ```
 
 Verify effective access with `getfacl /srv/opencode/workspaces` and
-`getfacl /home/rnwst-bot`. Mode bits shown by `ls` represent the ACL mask and
+`getfacl /home/<BOT_USER>`. Mode bits shown by `ls` represent the ACL mask and
 do not by themselves show each user's effective permissions.
 
 The administrator is intentionally not a trusted Nix user. Building on the
@@ -1292,7 +1321,7 @@ credential JSON and inspect the corresponding cloudflared unit. Set
 Cloudflare:
 
 ```bash
-ssh -L 4096:127.0.0.1:4096 rnwst-admin@<VPS_IP>
+ssh -L 4096:127.0.0.1:4096 <ADMIN_USER>@<VPS_IP>
 ```
 
 Then browse to `http://127.0.0.1:4096` through the tunnel.
