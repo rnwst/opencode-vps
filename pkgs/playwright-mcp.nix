@@ -5,13 +5,36 @@ let
     name: _: pkgs.lib.hasPrefix "chromium_headless_shell-" name
   ) pkgs.playwright-driver.browsers.entries;
   headlessShell = "${builtins.head (builtins.attrValues shells)}/chrome-headless-shell-linux64/chrome-headless-shell";
+  # WebKit's release build ignores WEBKIT_TLS_CAFILE_PEM. Give its GIO TLS
+  # backend the session CA bundle, while retaining chain and hostname checks.
+  webkit = pkgs.playwright-driver.components.webkit.override {
+    glib-networking = pkgs.glib-networking.overrideAttrs (old: {
+      postPatch = (old.postPatch or "") + ''
+        substituteInPlace tls/gnutls/gtlsdatabase-gnutls.c \
+          --replace-fail \
+            'int gerr = gnutls_x509_trust_list_add_system_trust (trust_list, 0, 0);' \
+            'const char *bundle = g_getenv ("SSL_CERT_FILE");
+             int gerr = bundle ? gnutls_x509_trust_list_add_trust_file (trust_list, bundle, NULL, GNUTLS_X509_FMT_PEM, 0, 0) : gnutls_x509_trust_list_add_system_trust (trust_list, 0, 0);'
+      '';
+    });
+  };
   launcher = pkgs.writeText "opencode-playwright-mcp.cjs" ''
     const fs = require('node:fs');
     const path = require('node:path');
     const { X509Certificate } = require('node:crypto');
     const { spawn, execFileSync } = require('node:child_process');
+    const http = require('node:http');
+    const net = require('node:net');
 
+    (async () => {
     const root = process.env.HOME;
+    const browser = process.argv[2];
+    if (browser === 'firefox') {
+      // Use Mesa's headless EGL path instead of GLX, which needs an X display.
+      // Firefox dlopens the EGL dispatch library, so provide its pinned path.
+      process.env.MOZ_WEBGL_FORCE_EGL = '1';
+      process.env.LD_LIBRARY_PATH = '${pkgs.lib.makeLibraryPath [ pkgs.libglvnd ]}';
+    }
     // The backend owns this directory and removes it after namespace teardown,
     // including cancellation by SIGKILL. Never remove it from this process.
     for (const dir of [process.env.TMPDIR, process.env.XDG_CONFIG_HOME,
@@ -27,13 +50,14 @@ let
       throw new Error('HTTP_PROXY must be the session-local SRT HTTP proxy');
     }
 
-    // Chromium does not use Node/OpenSSL's CA environment variables. Import
+    // Chromium and Firefox do not use Node/OpenSSL's CA variables. Import
     // only CA certificates from SRT's public bundle, never its private key.
-    const database = path.join(root, '.pki', 'nssdb');
+    const database = browser === 'firefox' ? path.join(root, 'firefox-profile') : path.join(root, '.pki', 'nssdb');
     fs.mkdirSync(database, { recursive: true, mode: 0o700 });
     execFileSync('${pkgs.nssTools}/bin/certutil',
       ['-N', '-d', 'sql:' + database, '--empty-password']);
     const certificates = new Set();
+    const trustedPem = [];
     for (const bundle of new Set([
       process.env.SSL_CERT_FILE, process.env.NODE_EXTRA_CA_CERTS,
     ].filter(Boolean))) {
@@ -44,6 +68,7 @@ let
         const cert = new X509Certificate(block);
         if (!cert.ca || certificates.has(cert.fingerprint256)) continue;
         certificates.add(cert.fingerprint256);
+        trustedPem.push(block);
         execFileSync('${pkgs.nssTools}/bin/certutil', [
           '-A', '-d', 'sql:' + database, '-n', cert.fingerprint256,
           '-t', 'C,,', '-a',
@@ -51,22 +76,124 @@ let
       }
     }
     if (!certificates.size) throw new Error('SRT CA trust is unavailable');
+    if (browser === 'webkit') {
+      const bundle = path.join(root, 'trust.pem');
+      fs.writeFileSync(bundle, trustedPem.join('\n'), { mode: 0o600 });
+      process.env.SSL_CERT_FILE = bundle;
+    }
+
+    let browserProxy = {
+      server: proxy.origin,
+      username: decodeURIComponent(proxy.username),
+      password: decodeURIComponent(proxy.password),
+      bypass: '<-loopback>,127.0.0.1,localhost,[::1]',
+    };
+    if (browser !== 'chromium') {
+      // Firefox and WebKit treat bypass hostnames as suffixes. Route exact
+      // loopback here instead, and keep SRT credentials out of WebKit headers.
+      const authorization = 'Basic ' + Buffer.from(
+        browserProxy.username + ':' + browserProxy.password).toString('base64');
+      const relay = http.createServer();
+      relay.maxConnections = 128;
+      const forward = (request, response, head) => {
+        const tunnel = request.method === 'CONNECT';
+        let target;
+        try {
+          target = new URL(tunnel ? 'http://' + request.url : request.url);
+          if (target.protocol === 'ws:') target.protocol = 'http:';
+          if (target.protocol !== 'http:' || target.username || target.password)
+            throw new Error('invalid proxy target');
+        } catch {
+          response.destroy();
+          return;
+        }
+        const local = ['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname);
+        const host = local ? (target.hostname === '[::1]' ? '::1' : '127.0.0.1') : proxy.hostname.replace(/^\[|\]$/g, "");
+        const port = local ? (target.port || 80) : proxy.port;
+        const headers = { ...request.headers };
+        delete headers['proxy-authorization'];
+        delete headers['proxy-connection'];
+        if (!local) headers['proxy-authorization'] = authorization;
+        const splice = (socket, buffered = Buffer.alloc(0)) => {
+          socket.on('error', () => response.destroy());
+          response.on('error', () => socket.destroy());
+          response.on('close', () => socket.destroy());
+          socket.on('close', () => response.destroy());
+          if (buffered.length) response.write(buffered);
+          if (head?.length) socket.write(head);
+          response.pipe(socket).pipe(response);
+        };
+        if (tunnel && local) {
+          const socket = net.connect({ host, port });
+          socket.on('error', () => response.destroy());
+          response.on('close', () => socket.destroy());
+          socket.once('connect', () => {
+            response.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+            splice(socket);
+          });
+          return;
+        }
+        const outgoing = http.request({
+          host, port, method: request.method, headers, agent: false,
+          path: tunnel ? request.url : local ? target.pathname + target.search : target.href,
+        });
+        outgoing.on('error', () => response.destroy());
+        response.on('close', () => outgoing.destroy());
+        outgoing.on('connect', (incoming, socket, buffered) => {
+          if (incoming.statusCode !== 200) {
+            socket.destroy();
+            response.destroy();
+            return;
+          }
+          response.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          splice(socket, buffered);
+        });
+        outgoing.on('upgrade', (incoming, socket, buffered) => {
+          response.write('HTTP/1.1 101 Switching Protocols\r\n' +
+            Object.entries(incoming.headers).map(([k, v]) => k + ': ' + v).join('\r\n') + '\r\n\r\n');
+          splice(socket, buffered);
+        });
+        outgoing.on('response', incoming => {
+          if (head !== undefined) {
+            incoming.destroy();
+            response.destroy();
+            return;
+          }
+          response.writeHead(incoming.statusCode, incoming.headers);
+          incoming.on('error', () => response.destroy());
+          incoming.pipe(response);
+        });
+        request.on('error', () => outgoing.destroy());
+        if (head !== undefined) outgoing.end();
+        else request.pipe(outgoing);
+      };
+      relay.on('request', forward);
+      relay.on('connect', forward);
+      relay.on('upgrade', forward);
+      await new Promise((resolve, reject) => {
+        relay.once('error', reject);
+        relay.listen(0, '127.0.0.1', resolve);
+      });
+      browserProxy = { server: 'http://127.0.0.1:' + relay.address().port };
+    }
 
     // Playwright strips URL userinfo; proxy authentication needs separate fields.
     const config = path.join(root, 'mcp.json');
     fs.writeFileSync(config, JSON.stringify({
-      browser: { launchOptions: { proxy: {
-        server: proxy.origin,
-        username: decodeURIComponent(proxy.username),
-        password: decodeURIComponent(proxy.password),
-        // Remove Chromium's implicit 127/8 and link-local bypass first.
-        bypass: '<-loopback>,127.0.0.1,localhost,[::1]',
-      } } },
+      browser: { launchOptions: {
+        proxy: browserProxy,
+        ...(browser === 'firefox' ? { firefoxUserPrefs: {
+          // Override the headless GPU blocklist; LIBGL_ALWAYS_SOFTWARE still applies.
+          'webgl.force-enabled': true,
+        } } : {}),
+      } },
     }), { mode: 0o600 });
     const child = spawn('${pkgs.playwright-mcp}/bin/playwright-mcp', [
       '--config', config,
-      '--headless', '--isolated', '--browser', 'chromium',
-      '--executable-path', '${headlessShell}',
+      '--headless', '--browser', browser,
+      ...(browser === 'firefox' ? ['--user-data-dir', database] : ['--isolated']),
+      ...(browser === 'chromium' ? ['--executable-path', '${headlessShell}'] : []),
+      ...(browser === 'webkit' ? ['--executable-path', '${webkit}/pw_run.sh'] : []),
       // The enclosing session bwrap/seccomp sandbox remains mandatory.
       '--no-sandbox', '--output-dir', path.join(root, 'output'),
     ], { stdio: 'inherit' });
@@ -74,6 +201,7 @@ let
       process.on(signal, () => child.kill(signal));
     child.on('error', error => { console.error(error); process.exit(1); });
     child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+    })().catch(error => { console.error(error); process.exit(1); });
   '';
 in
 assert pkgs.stdenv.hostPlatform.isx86_64 && pkgs.stdenv.hostPlatform.isLinux;
@@ -82,7 +210,12 @@ pkgs.writeShellApplication {
   name = "opencode-playwright-mcp";
   runtimeInputs = [ pkgs.coreutils ];
   text = ''
-    [[ $# -eq 0 ]] || { echo "opencode-playwright-mcp accepts no arguments" >&2; exit 64; }
+    [[ $# -le 1 ]] || { echo "expected at most one browser name" >&2; exit 64; }
+    browser="''${1-chromium}"
+    case "$browser" in
+      chromium|firefox|webkit) ;;
+      *) echo "expected chromium, firefox or webkit" >&2; exit 64 ;;
+    esac
     [[ "''${SANDBOX_RUNTIME:-}" == 1 && -n "''${HTTP_PROXY:-}" ]] || {
       echo "opencode-playwright-mcp must run inside the session SRT sandbox" >&2
       exit 77
@@ -116,9 +249,11 @@ pkgs.writeShellApplication {
       SSL_CERT_FILE="''${SSL_CERT_FILE:-}" \
       NODE_EXTRA_CA_CERTS="''${NODE_EXTRA_CA_CERTS:-}" \
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+      LIBGL_ALWAYS_SOFTWARE=1 \
+      __EGL_VENDOR_LIBRARY_FILENAMES=${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json \
       FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }} \
       ${pkgs.util-linux}/bin/unshare \
         --user --map-current-user --pid --fork --kill-child=SIGKILL --mount-proc -- \
-      ${pkgs.nodejs}/bin/node ${launcher}
+      ${pkgs.nodejs}/bin/node ${launcher} "$browser"
   '';
 }

@@ -88,27 +88,40 @@ and `api.github.com`.
 ### Playwright MCP
 
 With previews enabled, managed OpenCode configuration enables the `playwright`
-MCP server. Both the MCP package and its matching Chromium headless shell come
-from pinned stable nixpkgs; no runtime npm installation or browser download is
-needed.
+MCP server. The MCP package and matching Chromium headless shell (Blink), Firefox
+(Gecko), and WebKit come from pinned stable nixpkgs; no runtime npm installation
+or browser download is needed. Chromium is the default. Call
+`playwright_browser_select` with `{"browser":"firefox"}`, `{"browser":"webkit"}`,
+or `{"browser":"chromium"}` to select the engine for the current session runtime.
+Changing engines closes the old browser and removes its state and output files;
+selecting the current engine preserves them. Other sessions are unaffected.
+The choice survives browser closure/errors but resets when the runtime expires.
 
 OpenCode shares MCP connections across conversations, so the managed plugin
 adds trusted session routing metadata to each `playwright_*` tool call. A
 stdio adapter forwards it over the existing private runtime control socket.
-Tool schemas are captured from the pinned upstream package at build time; no
-browser or upstream tool code runs in the host adapter. The runtime supervisor
-owns a separate persistent MCP child for each session, independent of shell
+Upstream tool schemas are captured at build time, with a local browser-selection
+tool added to the catalog; no browser or upstream tool code runs in the host
+adapter. The runtime supervisor owns a separate persistent MCP child for each
+session, independent of shell
 execution and subject to the same workspace ownership, resource limits, and
 runtime teardown. Missing routing metadata fails closed.
 
 The browser reaches the session's development servers at
 `http://localhost:PORT`. Public websites go through SRT's authenticated proxy;
 private destinations and SSH remain blocked. Only exact session loopback
-addresses bypass the proxy. Chromium trusts the sandbox's CA bundle without
-disabling TLS verification. Its headless shell works with the existing
-Unix-socket filter; Chromium's inner sandbox is disabled because the mandatory
-outer bubblewrap/seccomp sandbox already applies. No host CDP endpoint or public
-MCP listener is exposed.
+addresses bypass the proxy. Firefox and WebKit use a session-local forwarding
+proxy for exact loopback matching, since their native bypass lists also match
+hostname suffixes. The relay adds SRT credentials only on upstream proxy requests,
+not on requests to origins. All engines trust the sandbox's CA bundle without
+disabling TLS verification: Chromium and Firefox use private NSS databases, and
+WebKit uses a scoped GIO TLS backend patch to load the session bundle. WebKit and
+Firefox WebGL2 use Mesa software rendering without a display or GPU. Firefox
+loads the pinned EGL library and opts into WebGL despite its headless GPU
+blocklist; rendering remains CPU-backed (llvmpipe), not GPU-accelerated.
+All engines work with the existing Unix-socket filter. Chromium's inner
+sandbox remains disabled because the mandatory outer bubblewrap/seccomp
+sandbox already applies. No host CDP endpoint or public MCP listener is exposed.
 
 Browser state persists between calls within a session. Closing the browser or
 its last tab retires the MCP helper so an otherwise idle runtime can expire.
@@ -1154,14 +1167,18 @@ Run `nix flake check` and the focused preview checks before an operator deploys:
 nix build .#checks.x86_64-linux.previews
 nix build .#checks.x86_64-linux.previews-vm
 nix build .#checks.x86_64-linux.previews-browser
+nix build .#checks.x86_64-linux.playwright-mcp
 ```
 
 `previews` covers the gateway, manager, and supervisor. `previews-vm` exercises
 the real SRT wrapper, delegated cgroups, persistent servers, isolation, token
 revocation, and cleanup. `previews-browser` uses Chromium at desktop/mobile
 sizes to test navigation, secure cookies, and browser request boundaries against
-local fixtures; it does not contact Cloudflare or a deployed server. Include
-`tests/` when transferring the flake to the VPS.
+local fixtures; it does not contact Cloudflare or a deployed server.
+`playwright-mcp` tests all three engines under the real SRT sandbox, including
+screenshots, Firefox WebGL2 shader rendering and pixel readback, WebSockets,
+proxy authentication, CA trust, TLS rejection, exact loopback routing, and
+detached-process cleanup. Include `tests/` when transferring the flake to the VPS.
 
 ## Daily Operation
 

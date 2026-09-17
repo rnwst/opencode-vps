@@ -380,6 +380,24 @@ async def catalog(executable):
             )
             result = await exchange(2, "tools/list", {})
             validate_catalog(result)
+            result["tools"].append(
+                {
+                    "name": "browser_select",
+                    "description": "Select chromium (Blink, default), firefox (Gecko), or webkit for this session. Changing engines closes the current browser and deletes its state and output files. Selection lasts until the session runtime expires.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "browser": {
+                                "type": "string",
+                                "enum": ["chromium", "firefox", "webkit"],
+                            }
+                        },
+                        "required": ["browser"],
+                        "additionalProperties": False,
+                    },
+                }
+            )
+            validate_catalog(result)
             return result
     finally:
         with contextlib.suppress(ProcessLookupError):

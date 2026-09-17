@@ -56,7 +56,13 @@ for line in sys.stdin:
     count += 1
     name, arguments = request["params"]["name"], request["params"]["arguments"]
     response = {"jsonrpc": "2.0", "id": request["id"]}
-    result = {"pid": pid, "count": count, "arguments": arguments, "home": str(home)}
+    result = {
+        "pid": pid,
+        "count": count,
+        "arguments": arguments,
+        "home": str(home),
+        "browser": sys.argv[1] if len(sys.argv) > 1 else "chromium",
+    }
     if name == "browser_tabs":
         action = arguments["action"]
         if action == "new" or (action == "list" and not tabs):

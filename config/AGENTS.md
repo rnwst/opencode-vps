@@ -61,6 +61,10 @@ separate, credential-free account. Do not invoke Docker directly from shells.
 
 Use Playwright MCP tools (`playwright_*`) to test previews at
 `http://localhost:PORT` or browse public websites.
+Chromium (Blink) is the default. Use `playwright_browser_select` with `browser`
+set to `firefox` (Gecko), `webkit`, or `chromium` to choose the engine for this
+session. Changing engines clears browser state and output files; selecting the
+current engine preserves them. Runtime expiry resets the choice to Chromium.
 Read or copy needed browser output files through shell commands before closing
 the browser or its last tab. Tool errors and cancellation also clear browser
 state and remove those files.

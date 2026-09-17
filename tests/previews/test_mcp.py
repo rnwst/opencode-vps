@@ -47,7 +47,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     str(Path(__file__).with_name("fake_mcp.py")),
                 ]
             )
-            + "\n"
+            + ' "$@"\n'
         )
         launcher.chmod(0o700)
         self.manager.config["playwright_mcp"] = str(launcher)
@@ -189,6 +189,44 @@ except RuntimeError:
         self.assertNotEqual(fresh["pid"], first["pid"])
         self.assertFalse(Path(first["home"]).exists())
         self.assertEqual(len(self.manager.spawned), 1)
+
+    async def test_browser_selection_is_session_scoped_and_retires_old_state(self):
+        other = self.workspace("other-browser")
+        first = await self.result()
+        self.assertEqual(first["browser"], "chromium")
+        for browser in ("firefox", "webkit", "chromium"):
+            selected = await self.result("browser_select", {"browser": browser})
+            self.assertIn(browser, selected["content"][0]["text"])
+            self.assertFalse(Path(first["home"]).exists())
+            current = await self.result()
+            self.assertEqual(current["browser"], browser)
+            self.assertNotEqual(current["pid"], first["pid"])
+            await self.result("browser_select", {"browser": browser})
+            self.assertEqual((await self.result())["pid"], current["pid"])
+            self.assertEqual(
+                (await self.result(session_id="ses_two", directory=str(other)))[
+                    "browser"
+                ],
+                "chromium",
+            )
+            await self.result("browser_close")
+            first = await self.result()
+            self.assertEqual(first["browser"], browser)
+        for arguments in (
+            {},
+            {"browser": "chrome"},
+            {"browser": []},
+            {"browser": "firefox", "args": []},
+        ):
+            async with await self.call("browser_select", arguments) as response:
+                self.assertEqual(response.status, 400)
+            self.assertEqual((await self.result())["pid"], first["pid"])
+
+    async def test_select_before_first_browser_call(self):
+        await self.result("browser_select", {"browser": "webkit"})
+        self.assertEqual((await self.result())["browser"], "webkit")
+        self.assertTrue((await self.result("tool_error"))["isError"])
+        self.assertEqual((await self.result())["browser"], "webkit")
 
     async def test_large_request_uses_nonblocking_stdin(self):
         arguments = {"code": "x" * 100000, "unicode": "\u00e9\U0001f642"}
