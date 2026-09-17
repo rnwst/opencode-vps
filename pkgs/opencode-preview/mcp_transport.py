@@ -41,6 +41,14 @@ def validate_request(request):
         or not isinstance(request["params"]["arguments"], dict)
     ):
         raise ValueError("invalid MCP request")
+    if request["params"]["name"] == "browser_select":
+        arguments = request["params"]["arguments"]
+        if set(arguments) != {"browser"} or arguments["browser"] not in (
+            "chromium",
+            "firefox",
+            "webkit",
+        ):
+            raise ValueError("expected chromium, firefox or webkit")
     pending = [(request, 0)]
     while pending:
         value, depth = pending.pop()
@@ -90,6 +98,7 @@ class MCPChild:
             raise ValueError("MCP launcher must be an absolute trusted path")
         self.supervisor = supervisor
         self.executable = executable
+        self.browser = "chromium"
         self.process = None
         self.retired = None
         self.retire_deadline = 0
@@ -123,6 +132,13 @@ class MCPChild:
         if self.id is not None:
             self.supervisor.error(id, "MCP is busy")
             return
+        if request["params"]["name"] == "browser_select":
+            browser = request["params"]["arguments"]["browser"]
+            if browser != self.browser:
+                # Reuse retirement so selection completes only after the old
+                # namespace is reaped and its private files are removed.
+                self.reset()
+                self.browser = browser
         self.id = self.last_id = id
         self.request = request
         self.received = 0
@@ -134,6 +150,9 @@ class MCPChild:
 
     def start(self):
         try:
+            if self.request["params"]["name"] == "browser_select":
+                self.forward()
+                return
             if self.process is None:
                 root = MCP_TMP / home_directory(
                     self.supervisor.environment.get("OPENCODE_PREVIEW_RUNTIME_ID")
@@ -151,7 +170,7 @@ class MCPChild:
                 if self.home.resolve(strict=True) != self.home:
                     raise ValueError("invalid MCP private home")
                 self.process = subprocess.Popen(
-                    [self.executable],
+                    [self.executable, self.browser],
                     cwd=self.supervisor.workspace,
                     env={
                         **self.supervisor.environment,
@@ -186,6 +205,22 @@ class MCPChild:
             self.reset("MCP startup failed")
 
     def forward(self):
+        if self.request["params"]["name"] == "browser_select":
+            self.result = json.dumps(
+                {
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Selected {self.browser} for this session.",
+                            }
+                        ]
+                    }
+                }
+            ).encode()
+            self.offset = 0
+            self.phase = "result"
+            return
         self.phase = "call"
         self.sequence += 1
         self.rpc_id = str(self.sequence)
@@ -294,11 +329,18 @@ class MCPChild:
         if self.id is not None and time.monotonic() >= self.deadline:
             self.reset("MCP request timed out")
             return
-        if self.process is None and self.id is not None and self.retired is None:
+        if (
+            self.process is None
+            and self.id is not None
+            and self.retired is None
+            and self.result is None
+        ):
             self.start()
-        if self.process is None:
-            return
-        if self.process.poll() is not None and self.result is None:
+        if (
+            self.process is not None
+            and self.process.poll() is not None
+            and self.result is None
+        ):
             self.reset("MCP child exited")
             return
         if self.result is not None and writable:
@@ -317,6 +359,8 @@ class MCPChild:
                     self.reset()
                     self.retire_barrier = barrier
                     return
+        if self.process is None:
+            return
         self.supervisor.watch(
             self.process.stdin,
             selectors.EVENT_WRITE if self.output else 0,

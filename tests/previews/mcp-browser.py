@@ -1,12 +1,13 @@
-"""Stdio MCP and real headless shell under the production AF_UNIX filter.
+"""Stdio MCP and all three browser engines under the production AF_UNIX filter.
 
 Runs inside the real SRT bwrap/seccomp sandbox. An offline proxy fixture exercises
-authenticated CONNECT, NSS CA trust, rejection of invalid TLS, and exact bypass.
+authenticated CONNECT, CA trust, rejection of invalid TLS, and exact bypass.
 The session manager and public network are not exercised here.
 """
 
 import base64
 import errno
+import hashlib
 import http.server
 import json
 import os
@@ -29,12 +30,21 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-PAGE = b"<title>MCP preview</title><h1>Headless shell rendered</h1>"
+PAGE = b"<title>MCP preview</title><h1>Browser rendered</h1>"
 AUTH = "Basic " + base64.b64encode(b"srt:fixture-secret").decode()
 
 
 class BrowserTests(unittest.TestCase):
-    def test_mcp_browser(self):
+    def test_chromium(self):
+        self.check_browser("chromium")
+
+    def test_firefox(self):
+        self.check_browser("firefox")
+
+    def test_webkit(self):
+        self.check_browser("webkit")
+
+    def check_browser(self, browser):
         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             with self.assertRaises(OSError) as denied:
                 socket.socket(socket.AF_UNIX, kind)
@@ -134,8 +144,11 @@ Path('namespace-write-probe').touch()
                 contexts[name] = context
 
             requests = []
+            leaked_credentials = []
 
             class Handler(http.server.BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
                 def log_message(self, *_args):
                     pass
 
@@ -144,6 +157,31 @@ Path('namespace-write-probe').touch()
                         requests.append(self.path)
                         self.send_error(403)
                         return
+                    if self.headers.get("Proxy-Authorization"):
+                        leaked_credentials.append(self.path)
+                    if self.headers.get("Upgrade", "").lower() == "websocket":
+                        self.close_connection = True
+                        accept = base64.b64encode(
+                            hashlib.sha1(
+                                (
+                                    self.headers["Sec-WebSocket-Key"]
+                                    + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                                ).encode()
+                            ).digest()
+                        ).decode()
+                        self.send_response(101)
+                        self.send_header("Upgrade", "websocket")
+                        self.send_header("Connection", "Upgrade")
+                        self.send_header("Sec-WebSocket-Accept", accept)
+                        self.end_headers()
+                        self.wfile.write(b"\x81\x02ok")
+                        self.wfile.flush()
+                        self.connection.settimeout(5)
+                        try:
+                            self.rfile.read(2)
+                        except OSError:
+                            pass
+                        return
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html")
                     self.send_header("Content-Length", str(len(PAGE)))
@@ -151,6 +189,7 @@ Path('namespace-write-probe').touch()
                     self.wfile.write(PAGE)
 
                 def do_CONNECT(self):
+                    self.close_connection = True
                     if self.headers.get("Proxy-Authorization") != AUTH:
                         self.send_response(407)
                         self.send_header(
@@ -174,6 +213,8 @@ Path('namespace-write-probe').touch()
                                 if not chunk:
                                     return
                                 incoming += chunk
+                            if b"proxy-authorization:" in incoming.lower():
+                                leaked_credentials.append(host)
                             tls.sendall(
                                 b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
                                 b"Connection: close\r\nContent-Length: "
@@ -236,7 +277,7 @@ Path('namespace-write-probe').touch()
             with ExitStack() as stack:
                 mcp = stack.enter_context(
                     subprocess.Popen(
-                        [command],
+                        [command, browser],
                         env=env,
                         stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE,
@@ -315,7 +356,72 @@ Path('namespace-write-probe').touch()
                         "browser_evaluate",
                         {"function": "() => document.querySelector('h1').textContent"},
                     )
-                    self.assertIn("Headless shell rendered", json.dumps(rendered))
+                    self.assertIn("Browser rendered", json.dumps(rendered))
+                if browser == "firefox":
+                    webgl = tool(
+                        "browser_evaluate",
+                        {
+                            "function": """() => {
+                            const canvas = document.createElement('canvas');
+                            canvas.width = canvas.height = 4;
+                            document.body.append(canvas);
+                            let failure = '';
+                            canvas.addEventListener('webglcontextcreationerror', event => {
+                                failure = event.statusMessage;
+                            });
+                            const gl = canvas.getContext('webgl2');
+                            if (!gl) throw new Error('WebGL2 unavailable: ' + failure);
+                            const program = gl.createProgram();
+                            for (const [type, source] of [
+                                [gl.VERTEX_SHADER, `#version 300 es
+                                    void main() {
+                                        vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+                                        gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+                                    }`],
+                                [gl.FRAGMENT_SHADER, `#version 300 es
+                                    precision highp float;
+                                    out vec4 color;
+                                    void main() { color = vec4(0.0, 1.0, 0.0, 1.0); }`],
+                            ]) {
+                                const shader = gl.createShader(type);
+                                gl.shaderSource(shader, source);
+                                gl.compileShader(shader);
+                                if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+                                    throw new Error(gl.getShaderInfoLog(shader));
+                                gl.attachShader(program, shader);
+                            }
+                            gl.linkProgram(program);
+                            if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+                                throw new Error(gl.getProgramInfoLog(program));
+                            gl.useProgram(program);
+                            gl.drawArrays(gl.TRIANGLES, 0, 3);
+                            const pixel = new Uint8Array(4);
+                            gl.readPixels(1, 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+                            if (gl.getError() !== gl.NO_ERROR || pixel.join(',') !== '0,255,0,255')
+                                throw new Error('WebGL2 rendering failed: ' + pixel);
+                            const debug = gl.getExtension('WEBGL_debug_renderer_info');
+                            return 'webgl2-render-ok: ' + gl.getParameter(gl.VERSION) + '; ' +
+                                gl.getParameter(debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER);
+                        }"""
+                        },
+                    )
+                    self.assertIn("webgl2-render-ok", json.dumps(webgl))
+                    self.assertIn("WebGL 2.0", json.dumps(webgl))
+                    self.assertIn("llvmpipe", json.dumps(webgl).lower())
+                    print(
+                        "firefox: WebGL2 shader rendering and pixel readback passed using llvmpipe."
+                    )
+                websocket = tool(
+                    "browser_evaluate",
+                    {
+                        "function": f"""() => new Promise((resolve, reject) => {{
+                    const ws = new WebSocket('ws://127.0.0.1:{local.server_port}/');
+                    ws.onmessage = event => {{ resolve(event.data); ws.close(); }};
+                    ws.onerror = () => reject(new Error('WebSocket failed'));
+                }})"""
+                    },
+                )
+                self.assertIn("ok", json.dumps(websocket))
                 self.assertEqual(requests, [], "Session loopback went through proxy")
                 screenshot = tool("browser_take_screenshot", {"type": "png"})
                 images = [
@@ -339,11 +445,21 @@ Path('namespace-write-probe').touch()
                 )
                 self.assertIn("MCP preview", json.dumps(result))
                 self.assertIn("public.mcp.invalid:443", requests)
+                self.assertEqual(
+                    leaked_credentials, [], "Proxy credentials reached an origin"
+                )
                 for host in ("untrusted.mcp.invalid", "wrong-name.mcp.invalid"):
                     result = tool(
                         "browser_navigate", {"url": f"https://{host}/"}, error=True
                     )
-                    self.assertIn("ERR_CERT_", json.dumps(result))
+                    self.assertIn(
+                        {
+                            "chromium": "ERR_CERT_",
+                            "firefox": "SSL_ERROR",
+                            "webkit": "TLS certificate",
+                        }[browser],
+                        json.dumps(result),
+                    )
 
                 child_env = dict(
                     entry.split("=", 1)
@@ -363,13 +479,13 @@ Path('namespace-write-probe').touch()
                 self.assertEqual(mcp.wait(timeout=30), 0)
                 self.assertTrue(private_home.exists(), "Backend-owned HOME was removed")
 
-                # Reproduce backend cancellation while Chromium is alive in its
+                # Reproduce backend cancellation while the browser is alive in its
                 # own detached process group. PID fds avoid PID-reuse races.
                 cancelled_home = root / "cancelled-home"
                 cancelled_home.mkdir(mode=0o700)
                 mcp = stack.enter_context(
                     subprocess.Popen(
-                        [command],
+                        [command, browser],
                         env=dict(env, OPENCODE_PLAYWRIGHT_HOME=str(cancelled_home)),
                         stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE,
@@ -408,11 +524,15 @@ Path('namespace-write-probe').touch()
                         descriptor = os.pidfd_open(pid)
                         stack.callback(os.close, descriptor)
                         descendants.append(descriptor)
-                        if b"chrome-headless-shell" in (entry / "cmdline").read_bytes():
+                        if {
+                            "chromium": b"chrome-headless-shell",
+                            "firefox": b"firefox",
+                            "webkit": b"MiniBrowser",
+                        }[browser] in (entry / "cmdline").read_bytes():
                             detached_browser |= os.getpgid(pid) != mcp.pid
                     except (FileNotFoundError, PermissionError, ProcessLookupError):
                         continue
-                self.assertTrue(detached_browser, "Did not observe detached Chromium")
+                self.assertTrue(detached_browser, f"Did not observe detached {browser}")
                 self.assertGreater(len(descendants), 3)
                 os.killpg(mcp.pid, signal.SIGKILL)
                 self.assertEqual(mcp.wait(timeout=30), -signal.SIGKILL)
@@ -427,7 +547,7 @@ Path('namespace-write-probe').touch()
                     cancelled_home.exists(), "Backend-owned HOME was removed"
                 )
                 print(
-                    "MCP handshake, local preview, PNG, proxy authentication, NSS trust, "
+                    f"{browser}: MCP handshake, local preview, WebSocket, PNG, proxy authentication, CA trust, "
                     "TLS rejection, exact bypass and SIGKILL descendant cleanup passed "
                     "inside SRT with socket(AF_UNIX) denied."
                 )

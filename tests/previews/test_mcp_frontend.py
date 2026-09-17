@@ -498,7 +498,16 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_catalog_preserves_tools_and_only_initializes_and_lists(self):
-        self.assertEqual(await module.catalog(self.upstream()), CATALOG)
+        catalog = await module.catalog(self.upstream())
+        self.assertEqual(catalog["tools"][:-1], CATALOG["tools"])
+        selection = catalog["tools"][-1]
+        self.assertEqual(selection["name"], "browser_select")
+        self.assertEqual(
+            selection["inputSchema"]["properties"]["browser"]["enum"],
+            ["chromium", "firefox", "webkit"],
+        )
+        frontend = module.Frontend({"runtime_root": str(self.root)}, catalog)
+        self.assertIn("browser_select", frontend.names)
 
     async def test_catalog_cli_outputs_only_tools_list_result(self):
         process = await asyncio.create_subprocess_exec(
@@ -513,7 +522,8 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
         stdout, stderr = await asyncio.wait_for(process.communicate(), 5)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(stderr, b"")
-        self.assertEqual(module.decode(stdout), CATALOG)
+        self.assertEqual(module.decode(stdout)["tools"][:-1], CATALOG["tools"])
+        self.assertEqual(module.decode(stdout)["tools"][-1]["name"], "browser_select")
         self.assertEqual(len(stdout.splitlines()), 1)
 
     async def test_catalog_timeout_reaps_child(self):
