@@ -1,7 +1,7 @@
 {
   defaultModel = {
     providerID = "openai";
-    modelID = "gpt-6-astra-fast";
+    modelID = "gpt-6-astra";
   };
   # This file contains the public, installation-specific values a new operator
   # should replace when reusing the repository.

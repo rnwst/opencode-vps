@@ -424,7 +424,7 @@ Configure models in `hosts/opencode/settings.nix`:
 
 | Setting | Default model |
 | ------- | ------------- |
-| `defaultModel` | `openai/gpt-6-astra-fast` |
+| `defaultModel` | `openai/gpt-6-astra` |
 | `githubBridge.model` | `openai/gpt-6-astra` |
 
 List available IDs with `sudo -iu <BOT_USER> opencode models` and rebuild after
