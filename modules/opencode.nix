@@ -14,6 +14,8 @@ let
       autoupdate = false;
       enabled_providers = [ "openai" ];
       model = "${settings.defaultModel.providerID}/${settings.defaultModel.modelID}";
+      provider.${settings.defaultModel.providerID}.models.${settings.defaultModel.modelID}.options.reasoningEffort =
+        "high";
       mcp = lib.optionalAttrs previewCfg.enable {
         playwright = {
           type = "local";
