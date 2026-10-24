@@ -73,6 +73,10 @@
       };
 
       checks.${system} = {
+        searchfox-cli = import ./tests/searchfox-cli {
+          inherit pkgs;
+          searchfoxCli = localPackages.searchfox-cli;
+        };
         opencode-plugin = import ./tests/opencode-plugin {
           inherit pkgs settings;
           plugin = localPackages.opencode-plugin;

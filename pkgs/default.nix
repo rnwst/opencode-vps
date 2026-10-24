@@ -8,6 +8,7 @@ let
   botHome = "/home/${settings.accounts.bot.name}";
   opencode = import ./opencode.nix { inherit pkgsUnstable; };
   playwright-mcp = import ./playwright-mcp.nix { inherit pkgs; };
+  searchfox-cli = import ./searchfox-cli.nix { inherit pkgs; };
   previewCfg = import ../config/previews.nix {
     inherit settings;
     inherit (pkgs) lib;
@@ -221,6 +222,9 @@ let
       fi
       chmod 0700 "$session_tmp"
       install -d -m 0700 "$session_tmp/claude"
+      if [[ ! -d "$session_tmp/mozilla-artifacts" ]]; then
+        mkdir -m 0700 "$session_tmp/mozilla-artifacts"
+      fi
 
       # SRT's CA keys and settings must never be created in workload-visible /tmp.
       # This backing directory is hidden by denyRead; SRT rebinds only public
@@ -273,6 +277,9 @@ let
       export GRADLE_USER_HOME=/tmp/opencode-cache/gradle
       export JULIA_DEPOT_PATH=/tmp/opencode-cache/julia
       export MAVEN_OPTS="''${MAVEN_OPTS:-} -Dmaven.repo.local=/tmp/opencode-cache/maven"
+      # Avoid Gecko's Downloads lookup while it holds the profiler mutex:
+      # that lookup can launch a thread which needs the same mutex.
+      export MOZ_UPLOAD_DIR=/tmp/mozilla-artifacts
       export npm_config_cache=/tmp/opencode-cache/npm
       export PIP_CACHE_DIR=/tmp/opencode-cache/pip
       export UV_CACHE_DIR=/tmp/opencode-cache/uv
@@ -769,5 +776,6 @@ in
     playwright-mcp
     sandbox-exec
     sandbox-runtime
+    searchfox-cli
     ;
 }

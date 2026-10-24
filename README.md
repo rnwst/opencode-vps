@@ -85,6 +85,20 @@ Sandbox Runtime's TLS proxy restores it only in HTTPS requests to `github.com`.
 GitHub API clients use the separately masked token, restored for `github.com`
 and `api.github.com`.
 
+### Mozilla command-line tools
+
+`searchfox-cli` loads the runtime's `SSL_CERT_FILE` PEM bundle in addition to
+its built-in certificate roots, so it trusts the outbound proxy's CA while
+still verifying certificate chains and hostnames. The offline TLS regression
+check is `nix build .#checks.x86_64-linux.searchfox-cli`.
+
+Sandbox sessions set `MOZ_UPLOAD_DIR=/tmp/mozilla-artifacts` and create that
+directory in their private temporary storage. This avoids an `xpcshell` startup
+deadlock where Gecko holds the profiler mutex during a Downloads-directory
+lookup and waits for an IPC thread that needs the same mutex. The workaround
+keeps Firefox's sandbox enabled. Profiler dumps and Mozilla test artifacts in
+this directory persist for the session and are removed with its temporary data.
+
 ### Playwright MCP
 
 With previews enabled, managed OpenCode configuration enables the `playwright`
@@ -1265,7 +1279,9 @@ sudo nixos-rebuild switch --flake .#opencode
 ```
 
 From a non-NixOS workstation, stage the secret-free checkout and rebuild as
-root on the VPS:
+root on the VPS. Here `opencode-vps` is a workstation SSH alias in
+`~/.ssh/config` with `HostName <VPS_IP>` and `User <ADMIN_USER>`; both SSH and
+rsync use it:
 
 ```bash
 ssh <ADMIN_USER>@<VPS_IP> \

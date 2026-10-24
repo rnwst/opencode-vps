@@ -128,6 +128,11 @@ elif mode == "verify":
     assert json.loads(child_env)["GH_TOKEN"]
 elif mode == "inside":
     assert os.environ["TMPDIR"] == "/tmp/claude"
+    upload = Path(os.environ["MOZ_UPLOAD_DIR"])
+    assert upload == Path("/tmp/mozilla-artifacts")
+    assert upload.is_dir()
+    assert upload.stat().st_mode & 0o777 == 0o700
+    (upload / "probe").write_text(os.environ["OPENCODE_SESSION_ID"])
     Path("child-env.json").write_text(json.dumps(dict(os.environ)))
     # AF_UNIX creation is forbidden even though the pathname itself is visible.
     assert (fixture / "host.sock").is_socket()

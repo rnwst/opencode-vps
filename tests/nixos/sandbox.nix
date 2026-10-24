@@ -129,8 +129,9 @@ pkgs.testers.nixosTest {
         ${python} outside
         OPENCODE_SESSION_ID=ses_one ${wrapper} -c '${python} inside'
         OPENCODE_SESSION_ID=ses_one ${wrapper} -c 'test "$(cat /tmp/persist)" = session-one'
+        OPENCODE_SESSION_ID=ses_one ${wrapper} -c 'test "$(cat "$MOZ_UPLOAD_DIR/probe")" = ses_one'
         OPENCODE_SESSION_ID=ses_two ${wrapper} -c \
-          'test ! -e /tmp/persist && test ! -r ${temporary}/ses_one/persist && touch /tmp/session-two'
+          'test ! -e /tmp/persist && test ! -r ${temporary}/ses_one/persist && test -d "$MOZ_UPLOAD_DIR" && test ! -e "$MOZ_UPLOAD_DIR/probe" && touch /tmp/session-two'
         if ${localPackages.sandbox-runtime}/bin/srt --settings /run/sandbox-fixture/missing.json \
           -- ${pkgs.coreutils}/bin/touch ${workspace}/must-not-run > missing.log 2>&1; then
           echo 'SRT accepted a missing mandatory seccomp helper' >&2
