@@ -72,6 +72,8 @@ pkgs.testers.nixosTest {
     environment.systemPackages = with pkgs; [
       curl
       python3
+      xvfb
+      xdotool
     ];
     systemd.services.opencode-workspace-temp-init = {
       serviceConfig = {

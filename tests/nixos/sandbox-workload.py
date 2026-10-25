@@ -1,6 +1,7 @@
 """VM-only fixtures and assertions; uses the real wrapper, proxies and TLS."""
 
 import base64
+import ctypes
 import errno
 import http.server
 import json
@@ -76,7 +77,8 @@ if mode == "serve":
 
     unix = socketserver.UnixStreamServer(str(fixture / "host.sock"), Unix)
     os.chmod(fixture / "host.sock", 0o777)
-    servers = [unix]
+    abstract = socketserver.UnixStreamServer("\0sandbox-host-fixture", Unix)
+    servers = [unix, abstract]
     for port in (8080, 8081, 443):
         server = http.server.ThreadingHTTPServer(("0.0.0.0", port), HTTP)
         if port == 443:
@@ -88,9 +90,10 @@ if mode == "serve":
         threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Event().wait()
 elif mode == "outside":
-    with socket.socket(socket.AF_UNIX) as client:
-        client.connect(str(fixture / "host.sock"))
-        assert client.recv(32) == b"host-unix"
+    for address in (str(fixture / "host.sock"), "\0sandbox-host-fixture"):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(address)
+            assert client.recv(32) == b"host-unix"
 elif mode == "disclose":
     workspace, temporary = map(Path, sys.argv[2:])
     brokers = list(temporary.glob(".srt-broker.*"))
@@ -102,8 +105,6 @@ elif mode == "disclose":
     config = json.loads(configs[0].read_text())
     helper = Path(config["seccomp"]["applyPath"])
     assert helper.is_relative_to("/nix/store") and os.access(helper, os.X_OK)
-    with helper.open("rb") as binary:
-        assert binary.read(4) == b"\x7fELF", helper
     config["seccomp"]["applyPath"] = "/no-such-apply-seccomp"
     (fixture / "missing.json").write_text(json.dumps(config))
     certs = [p for p in files if p.name == "ca.crt"]
@@ -112,6 +113,7 @@ elif mode == "disclose":
         "broker": str(brokers[0]),
         "hidden": list(map(str, keys + configs)),
         "certs": list(map(str, certs)),
+        "sockets": list(map(str, brokers[0].rglob("*.sock"))),
     }
     (workspace / "manifest.new").write_text(json.dumps(manifest))
     (workspace / "manifest.new").rename(workspace / "manifest.json")
@@ -126,6 +128,19 @@ elif mode == "verify":
         not in child_env
     )
     assert json.loads(child_env)["GH_TOKEN"]
+elif mode == "blocked-profile":
+    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        denied(
+            lambda kind=kind: socket.socket(socket.AF_UNIX, kind),
+            (errno.EPERM,),
+        )
+elif mode == "other-session":
+    for address in ("/tmp/.X11-unix/X99", "\0/tmp/.X11-unix/X99"):
+        with socket.socket(socket.AF_UNIX) as client:
+            denied(
+                lambda address=address: client.connect(address),
+                (errno.ENOENT, errno.ECONNREFUSED),
+            )
 elif mode == "inside":
     assert os.environ["TMPDIR"] == "/tmp/claude"
     upload = Path(os.environ["MOZ_UPLOAD_DIR"])
@@ -134,13 +149,66 @@ elif mode == "inside":
     assert upload.stat().st_mode & 0o777 == 0o700
     (upload / "probe").write_text(os.environ["OPENCODE_SESSION_ID"])
     Path("child-env.json").write_text(json.dumps(dict(os.environ)))
-    # AF_UNIX creation is forbidden even though the pathname itself is visible.
-    assert (fixture / "host.sock").is_socket()
+    # Local IPC works, but neither host pathname nor host abstract sockets do.
+    assert not (fixture / "host.sock").exists()
+    for address in (
+        str(fixture / "host.sock"),
+        "/var/run/sandbox-fixture/host.sock",
+        "\0sandbox-host-fixture",
+    ):
+        with socket.socket(socket.AF_UNIX) as client:
+            denied(
+                lambda address=address: client.connect(address),
+                (errno.ENOENT, errno.ECONNREFUSED),
+            )
     for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
-        denied(
-            lambda kind=kind: socket.socket(socket.AF_UNIX, kind),
-            (errno.EPERM, errno.EACCES),
+        with socket.socket(socket.AF_UNIX, kind) as server:
+            address = f"/tmp/local-ipc-{kind}"
+            server.bind(address)
+            with socket.socket(socket.AF_UNIX, kind) as client:
+                if kind == socket.SOCK_STREAM:
+                    server.listen()
+                    client.connect(address)
+                    peer, _ = server.accept()
+                    with peer:
+                        client.sendall(b"local")
+                        assert peer.recv(5) == b"local"
+                else:
+                    client.sendto(b"local", address)
+                    assert server.recv(5) == b"local"
+
+    names = {path.read_text().strip() for path in Path("/proc").glob("[0-9]*/comm")}
+    assert not {"socat", "bwrap"} & names, names
+    denied(lambda: Path("/proc/1/root").readlink(), (errno.EPERM, errno.EACCES))
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.ptrace(16, 1, 0, 0) == -1  # PTRACE_ATTACH, with Yama disabled
+    assert ctypes.get_errno() == errno.EPERM
+    assert libc.syscall(425, 1, 0) == -1  # io_uring_setup remains blocked
+    assert ctypes.get_errno() == errno.EPERM
+
+    # Leave a detached display running: namespace teardown must kill it.
+    display = subprocess.Popen(
+        ["Xvfb", ":99", "-screen", "0", "640x480x24", "-nolisten", "tcp", "-ac"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    for _ in range(100):
+        assert display.poll() is None, "Xvfb exited during startup"
+        result = subprocess.run(
+            ["xdotool", "getdisplaygeometry"],
+            env={**os.environ, "DISPLAY": ":99"},
+            capture_output=True,
+            text=True,
+            check=False,
         )
+        if result.returncode == 0:
+            assert result.stdout.strip() == "640 480", result
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("Xvfb did not accept an X11 client")
     with socket.socket(socket.AF_INET) as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
@@ -157,6 +225,19 @@ elif mode == "inside":
         time.sleep(0.1)
     manifest = json.loads(Path("manifest.json").read_text())
     broker = Path(manifest["broker"])
+    assert manifest["sockets"], manifest
+    for name in manifest["sockets"]:
+        for address in (name, str(Path("/var/tmp") / Path(name).relative_to(broker))):
+            denied(lambda address=address: Path(address).stat())
+            # The original task backing path deliberately exceeds sun_path;
+            # the short /var/tmp alias exercises the actual connect denial.
+            if len(os.fsencode(address)) >= 108:
+                continue
+            with socket.socket(socket.AF_UNIX) as client:
+                denied(
+                    lambda address=address: client.connect(address),
+                    (errno.ENOENT, errno.EACCES),
+                )
     for name in manifest["hidden"]:
         path = Path(name)
         # Try the original path and both former session-/tmp alias layouts.
@@ -175,7 +256,8 @@ elif mode == "inside":
     denied(bundle.unlink, (errno.EROFS, errno.EACCES, errno.EPERM, errno.EBUSY))
     for cert in manifest["certs"]:
         public_path = Path("/var/tmp") / Path(cert).relative_to(broker)
-        assert b"BEGIN CERTIFICATE" in public_path.read_bytes()
+        if public_path != bundle:
+            denied(public_path.read_bytes)
     Path("/tmp/persist").write_text("session-one")
 
     assert (

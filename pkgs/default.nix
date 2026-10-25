@@ -27,6 +27,7 @@ let
       ./sandbox-runtime-host-policy.patch
       ./sandbox-runtime-hardening.patch
       ./sandbox-runtime-network.patch
+      ./sandbox-runtime-local-ipc.patch
     ];
     nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ [ pkgsUnstable.xxd ];
     buildInputs = (oldAttrs.buildInputs or [ ]) ++ [ pkgsUnstable.libseccomp ];
@@ -40,14 +41,24 @@ let
         if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64"
       }
       xxd -i -n unix_block_bpf unix-block.bpf > "$helper_dir/unix-block-bpf.h"
+      ./generate-seccomp unix-allow.bpf ${
+        if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64"
+      } --allow-unix-sockets
+      xxd -i -n unix_allow_bpf unix-allow.bpf > "$helper_dir/unix-allow-bpf.h"
       $CC -O2 -Wall -Wextra -I "$helper_dir" vendor/seccomp-src/apply-seccomp.c \
         -o "$helper_dir/apply-seccomp"
       rm generate-seccomp unix-block.bpf "$helper_dir/unix-block-bpf.h"
+      rm unix-allow.bpf "$helper_dir/unix-allow-bpf.h"
     '';
     postInstall = (oldAttrs.postInstall or "") + ''
       test -x "$out/lib/node_modules/@anthropic-ai/sandbox-runtime/$helper_dir/apply-seccomp"
     '';
   });
+
+  sandbox-isolate = import ./sandbox-isolate.nix {
+    inherit pkgs;
+    sandboxRuntime = sandbox-runtime;
+  };
 
   fishCompletionGenerator =
     pkgs.runCommandLocal "fish-completion-generator"
@@ -241,9 +252,7 @@ let
       fi
       settings_file="$broker_tmp/settings.json"
       trap 'rm -rf -- "$broker_tmp"' EXIT
-      seccomp="${sandbox-runtime}/lib/node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/${
-        if pkgs.stdenv.hostPlatform.isx86_64 then "x64" else "arm64"
-      }/apply-seccomp"
+      seccomp="${sandbox-isolate}/bin/opencode-sandbox-isolate"
       [[ -x "$seccomp" ]] || { echo "required sandbox seccomp helper is unavailable" >&2; exit 69; }
 
       if [[ "$mode" == "shell" && -n "''${CREDENTIALS_DIRECTORY:-}" && -r "$CREDENTIALS_DIRECTORY/github-token" ]]; then
@@ -269,6 +278,7 @@ let
       fi
 
       unset OPENCODE_SERVER_PASSWORD
+      export OPENCODE_SANDBOX_WORKSPACE="$root"
       export BUN_INSTALL_CACHE_DIR=/tmp/opencode-cache/bun
       export CARGO_HOME=/tmp/opencode-cache/cargo
       export DENO_DIR=/tmp/opencode-cache/deno
@@ -775,6 +785,7 @@ in
     opencode-workspace
     playwright-mcp
     sandbox-exec
+    sandbox-isolate
     sandbox-runtime
     searchfox-cli
     ;

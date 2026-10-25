@@ -133,7 +133,7 @@ WebKit uses a scoped GIO TLS backend patch to load the session bundle. WebKit an
 Firefox WebGL2 use Mesa software rendering without a display or GPU. Firefox
 loads the pinned EGL library and opts into WebGL despite its headless GPU
 blocklist; rendering remains CPU-backed (llvmpipe), not GPU-accelerated.
-All engines work with the existing Unix-socket filter. Chromium's inner
+All engines use the isolated local-IPC environment below. Chromium's inner
 sandbox remains disabled because the mandatory outer bubblewrap/seccomp
 sandbox already applies. No host CDP endpoint or public MCP listener is exposed.
 
@@ -150,12 +150,24 @@ to an unsandboxed host browser.
 
 ### Shell Sandbox Security
 
-The host patches the pinned Sandbox Runtime package in three ways:
+The host hardens the pinned Sandbox Runtime package and its launcher:
 
-- Build its native `apply-seccomp` helper from the vendored source and configure
-  its immutable Nix-store path. Missing or non-executable helpers fail closed;
-  SRT does not fall back to a global npm installation. The helper blocks new
-  Unix socket creation and isolates workload processes from the proxy relays.
+- Build its native `apply-seccomp` helper from the vendored source. The trusted
+  `opencode-sandbox-isolate` launcher always runs this helper, retaining its
+  nested PID namespace, non-dumpable init/reaper, private `/proc`, and seccomp
+  restrictions on `io_uring`. Namespace and procfs setup failures abort startup.
+  The launcher selects a local-IPC filter profile that permits Unix sockets;
+  the helper's default profile still blocks them. Do not enable SRT's
+  `allowAllUnixSockets` option: it bypasses the helper entirely.
+- Give workloads an allowlisted filesystem view after the proxy relays start.
+  It contains the read-only Nix store, selected system and Git configuration,
+  immutable NixOS runtime paths, the current workspace, session-private `/tmp`,
+  and the public trust bundle. Host runtime directories and broker sockets are
+  absent. Recursive workspace binds preserve SRT's read-only Git protections.
+  Bubblewrap closes extra inherited descriptors, and the native helper runs
+  inside this view with an additional PID namespace hiding the trusted relays
+  and bubblewrap processes. The session network namespace hides host abstract
+  Unix sockets while retaining loopback access to the TCP proxy listeners.
 - Check destination IP addresses in every outbound HTTP, CONNECT, SOCKS, and
   TLS-terminated connection. Loopback, private, link-local, multicast, reserved,
   and IPv4-transition address ranges are rejected, even for allowed hostnames.
@@ -167,10 +179,10 @@ The host patches the pinned Sandbox Runtime package in three ways:
   Single-shot fallback invocations instead use a separate `.srt-broker.*`
   directory beneath the workspace's temporary root. The outer sandbox mounts
   the broker at `/var/tmp` to keep Unix-socket paths short even for long workspace
-  names. Inner mounts hide both
-  the original backing path and `/var/tmp` from the workload, except
-  for read-only public trust files and the individual relay sockets needed by
-  trusted networking helpers. Persistent brokers and proxies last until runtime
+  names. The relays retain their own mount view so they can open broker sockets
+  for subsequent connections. Workloads see only the read-only public trust
+  bundle, with neither socket paths nor backing-directory aliases exposed.
+  Persistent brokers and proxies last until runtime
   teardown; normal command completion does not remove them. In single-shot
   fallback mode, command completion, including nonzero exits, shuts down the
   proxy and removes the broker directory.
@@ -184,23 +196,34 @@ public destinations into private networks without extending the egress policy.
 These checks cannot restrict what an allowed public server does on its own behalf.
 
 The restrictions apply to shell workloads, not the trusted OpenCode process or
-all of its built-in tools. They are not a general host firewall. The native
-filter blocks creation of Unix sockets, not operations on an already inherited
-socket, so do not pass host-service socket descriptors into workloads.
+all of its built-in tools. They are not a general host firewall. The workspace
+is deliberately shared storage: sockets placed there can provide IPC to other
+processes with access to that workspace. Use session-private `/tmp` for local
+services, and keep host-service sockets outside the workspace.
+
+Xvfb is available for graphical tools. For example, start
+`Xvfb :99 -screen 0 1280x720x24 -nolisten tcp` and run clients with `DISPLAY=:99`.
+Its Unix sockets live in the session's `/tmp/.X11-unix` and network namespace.
+A persistent runtime keeps the display across commands and kills it on runtime
+teardown; single-shot fallback invocations kill it when the command exits.
 
 Run the focused checks before deploying sandbox changes:
 
 ```bash
 nix build .#checks.x86_64-linux.sandbox-runtime
 nix build .#checks.x86_64-linux.sandbox-vm
+nix build .#checks.x86_64-linux.previews-vm
+nix build .#checks.x86_64-linux.playwright-mcp
 ```
 
 The first exercises real proxy implementations with controlled DNS and test
 connections, including rebinding and missing-helper regressions. The VM test
-uses the real wrapper under systemd hardening to verify Unix-socket restrictions,
+uses the real wrapper under systemd hardening to verify local Unix IPC and X11,
+host/broker socket isolation, relay process isolation with Yama disabled,
 private-key invisibility, public TLS and masked GitHub authentication, private
-destination rejection, and temporary-file isolation/cleanup. It does not contact
-real GitHub services or use production credentials.
+destination rejection, and temporary-file isolation/cleanup. Preview and browser
+checks cover persistent displays, runtime teardown, and all three browser engines.
+These tests do not contact real GitHub services or use production credentials.
 
 These controls contain common prompt-injection outcomes such as credential
 theft, workspace escape, host persistence, sudo use, and Docker-socket escape.

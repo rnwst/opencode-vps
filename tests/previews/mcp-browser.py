@@ -1,4 +1,4 @@
-"""Stdio MCP and all three browser engines under the production AF_UNIX filter.
+"""Stdio MCP and all three browser engines under production local-IPC isolation.
 
 Runs inside the real SRT bwrap/seccomp sandbox. An offline proxy fixture exercises
 authenticated CONNECT, CA trust, rejection of invalid TLS, and exact bypass.
@@ -6,7 +6,6 @@ The session manager and public network are not exercised here.
 """
 
 import base64
-import errno
 import hashlib
 import http.server
 import json
@@ -46,9 +45,8 @@ class BrowserTests(unittest.TestCase):
 
     def check_browser(self, browser):
         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
-            with self.assertRaises(OSError) as denied:
-                socket.socket(socket.AF_UNIX, kind)
-            self.assertIn(denied.exception.errno, (errno.EPERM, errno.EACCES))
+            with socket.socket(socket.AF_UNIX, kind):
+                pass
         # Chromium's anonymous IPC is distinct from named Unix sockets.
         first, second = socket.socketpair()
         first.close()
@@ -72,8 +70,9 @@ import errno, os, socket
 from pathlib import Path
 assert os.getpid() == 1
 assert 'NoNewPrivs:\\t1' in Path('/proc/self/status').read_text()
-for operation in (lambda: socket.socket(socket.AF_UNIX),
-                  lambda: Path('.git/config').open('w')):
+with socket.socket(socket.AF_UNIX):
+    pass
+for operation in (lambda: Path('.git/config').open('w'),):
     try:
         operation()
     except OSError as error:
@@ -549,7 +548,7 @@ Path('namespace-write-probe').touch()
                 print(
                     f"{browser}: MCP handshake, local preview, WebSocket, PNG, proxy authentication, CA trust, "
                     "TLS rejection, exact bypass and SIGKILL descendant cleanup passed "
-                    "inside SRT with socket(AF_UNIX) denied."
+                    "inside SRT with isolated local Unix IPC."
                 )
 
 

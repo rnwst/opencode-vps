@@ -39,6 +39,7 @@ pkgs.testers.nixosTest {
   name = "sandbox-security";
   nodes.machine = {
     virtualisation.memorySize = 2048;
+    boot.kernel.sysctl."kernel.yama.ptrace_scope" = 0;
     networking.firewall.enable = false;
     networking.hosts = {
       "93.184.216.34" = [
@@ -58,6 +59,8 @@ pkgs.testers.nixosTest {
       acl
       curl
       python3
+      xvfb
+      xdotool
     ];
     systemd.services.sandbox-fixture = {
       wantedBy = [ "multi-user.target" ];
@@ -95,6 +98,8 @@ pkgs.testers.nixosTest {
       path = with pkgs; [
         curl
         python3
+        xvfb
+        xdotool
       ];
       environment = {
         HOME = botHome;
@@ -135,7 +140,7 @@ pkgs.testers.nixosTest {
         ${python} outside
         # Exercise the real helper under service hardening. Only the procfs
         # mount fails; the workload must never inherit the outer /proc view.
-        ${seccompHelper} ${pkgs.coreutils}/bin/true
+        ${seccompHelper} ${python} blocked-profile
         if LC_ALL=C LD_PRELOAD=${denyProcMount} ${seccompHelper} \
           ${pkgs.coreutils}/bin/touch ${workspace}/proc-mount-must-not-run > proc-mount.log 2>&1; then
           echo 'The isolation helper accepted a failed procfs mount' >&2
@@ -144,6 +149,10 @@ pkgs.testers.nixosTest {
         test ! -e proc-mount-must-not-run
         ${pkgs.gnugrep}/bin/grep -F 'apply-seccomp: mount(/proc): Operation not permitted' proc-mount.log
         OPENCODE_SESSION_ID=ses_one ${wrapper} -c '${python} inside'
+        if ${pkgs.procps}/bin/pgrep -x Xvfb; then
+          echo 'Xvfb survived workload teardown' >&2
+          exit 1
+        fi
         OPENCODE_SESSION_ID=ses_one ${wrapper} -c 'test "$(cat /tmp/persist)" = session-one'
         OPENCODE_SESSION_ID=ses_one ${wrapper} -c 'test "$(cat "$MOZ_UPLOAD_DIR/probe")" = ses_one'
         OPENCODE_SESSION_ID=ses_two ${wrapper} -c \
@@ -171,6 +180,8 @@ pkgs.testers.nixosTest {
         machine.succeed(f"curl --noproxy '*' --fail http://{host}:8081/health")
     machine.succeed("systemctl start --no-block sandbox-probe.service")
     machine.wait_until_succeeds("test -e ${workspace}/ready")
+    isolated = "cd ${workspace} && OPENCODE_SESSION_ID=ses_two ${wrapper} -c '${python} other-session'"
+    machine.succeed("runuser -u ${settings.accounts.bot.name} -- sh -c " + shlex.quote(isolated))
     machine.succeed("${python} disclose ${workspace} ${temporary}")
     machine.wait_for_unit("sandbox-probe.service")
     machine.succeed("test -f ${temporary}/ses_one/persist && test -f ${temporary}/ses_two/session-two")

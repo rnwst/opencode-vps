@@ -578,6 +578,27 @@ def integration(wrapper, config_path, task):
     )
     start("alpha", "ses_alpha", "alpha source")
     start("beta", "ses_beta", "beta source")
+
+    # X11 persists across commands in one runtime. Other runtimes can use the
+    # same display number with their own pathname and abstract Unix sockets.
+    for workspace in ("alpha", "beta"):
+        shell(
+            workspace,
+            "ses_" + workspace,
+            "Xvfb :99 -screen 0 640x480x24 -nolisten tcp -ac > /tmp/xvfb.log 2>&1 & "
+            "echo $! > /tmp/xvfb.pid",
+        )
+
+    def display_ready(workspace):
+        assert (
+            shell(
+                workspace, "ses_" + workspace, "DISPLAY=:99 xdotool getdisplaygeometry"
+            ).strip()
+            == "640 480"
+        )
+
+    eventually(lambda: display_ready("alpha"))
+    eventually(lambda: display_ready("beta"))
     entry_a, entry_b = eventually(lambda: ready(a)), eventually(lambda: ready(b))
     pool_limits()
     cookie_a, cookie_b = login(a, entry_a), login(b, entry_b)
@@ -856,6 +877,10 @@ def integration(wrapper, config_path, task):
         "Checking disclosed control paths, credentials, procfs and cgroups", flush=True
     )
     snap_a, snap_b = snapshot(entry_a, browser=True), snapshot(entry_b, browser=True)
+    for _, pids in (snap_a, snap_b):
+        assert any(
+            Path(f"/proc/{pid}/comm").read_text().strip() == "Xvfb" for pid in pids
+        )
     sockets = [str(path) for path in RUNTIME.rglob("*") if path.is_socket()]
     assert str(control) in sockets and len(sockets) >= 4, sockets
     for workspace, entry in (("alpha", entry_a), ("beta", entry_b)):

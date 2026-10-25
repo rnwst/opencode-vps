@@ -1,6 +1,7 @@
 {
   pkgs,
   sandboxRuntime,
+  sandboxIsolate,
   playwrightMcp ? import ../../pkgs/playwright-mcp.nix { inherit pkgs; },
 }:
 let
@@ -21,7 +22,7 @@ let
       };
       bwrapPath = "${pkgs.bubblewrap}/bin/bwrap";
       socatPath = "${pkgs.socat}/bin/socat";
-      seccomp.applyPath = "${sandboxRuntime}/lib/node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/x64/apply-seccomp";
+      seccomp.applyPath = "${sandboxIsolate}/bin/opencode-sandbox-isolate";
       ripgrep.command = "${pkgs.ripgrep}/bin/rg";
     }
   );
@@ -34,13 +35,14 @@ pkgs.runCommand "opencode-playwright-mcp-browser-tests"
     ];
     OPENCODE_PLAYWRIGHT_MCP = "${playwrightMcp}/bin/opencode-playwright-mcp";
     OPENCODE_UNSHARE = "${pkgs.util-linux}/bin/unshare";
+    OPENCODE_SANDBOX_WORKSPACE = "/tmp/mcp-workspace";
   }
   ''
     export PYTHONDONTWRITEBYTECODE=1
     mkdir -p /tmp/mcp-workspace/.git /tmp/claude
     printf 'protected fixture\n' > /tmp/mcp-workspace/.git/config
     cd /tmp/mcp-workspace
-    # Exercise the real SRT bwrap filesystem/network policy and AF_UNIX filter.
+    # Exercise the production local-IPC filesystem view and native isolation.
     ${sandboxRuntime}/bin/srt --settings ${settings} -- python3 ${./mcp-browser.py}
     touch "$out"
   ''

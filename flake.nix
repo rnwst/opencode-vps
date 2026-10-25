@@ -102,6 +102,7 @@
           inherit pkgs;
           sandboxRuntime = localPackages.sandbox-runtime;
           playwrightMcp = localPackages.playwright-mcp;
+          sandboxIsolate = localPackages.sandbox-isolate;
         };
         nixos = self.nixosConfigurations.opencode.config.system.build.toplevel;
       };
