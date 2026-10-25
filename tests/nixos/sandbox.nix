@@ -28,6 +28,12 @@ let
   workload = ./sandbox-workload.py;
   python = "${pkgs.python3}/bin/python3 ${workload}";
   wrapper = "${localPackages.sandbox-exec}/bin/opencode-sandbox-exec";
+  seccompHelper = "${localPackages.sandbox-runtime}/lib/node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/${
+    if pkgs.stdenv.hostPlatform.isx86_64 then "x64" else "arm64"
+  }/apply-seccomp";
+  denyProcMount = pkgs.runCommand "deny-proc-mount.so" { nativeBuildInputs = [ pkgs.stdenv.cc ]; } ''
+    $CC -shared -fPIC -Wall -Wextra -Werror ${./deny-proc-mount.c} -o "$out"
+  '';
 in
 pkgs.testers.nixosTest {
   name = "sandbox-security";
@@ -127,6 +133,16 @@ pkgs.testers.nixosTest {
       };
       script = ''
         ${python} outside
+        # Exercise the real helper under service hardening. Only the procfs
+        # mount fails; the workload must never inherit the outer /proc view.
+        ${seccompHelper} ${pkgs.coreutils}/bin/true
+        if LC_ALL=C LD_PRELOAD=${denyProcMount} ${seccompHelper} \
+          ${pkgs.coreutils}/bin/touch ${workspace}/proc-mount-must-not-run > proc-mount.log 2>&1; then
+          echo 'The isolation helper accepted a failed procfs mount' >&2
+          exit 1
+        fi
+        test ! -e proc-mount-must-not-run
+        ${pkgs.gnugrep}/bin/grep -F 'apply-seccomp: mount(/proc): Operation not permitted' proc-mount.log
         OPENCODE_SESSION_ID=ses_one ${wrapper} -c '${python} inside'
         OPENCODE_SESSION_ID=ses_one ${wrapper} -c 'test "$(cat /tmp/persist)" = session-one'
         OPENCODE_SESSION_ID=ses_one ${wrapper} -c 'test "$(cat "$MOZ_UPLOAD_DIR/probe")" = ses_one'
