@@ -51,7 +51,13 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.config = {"runtime_root": str(self.root)}
+        self.config = {"runtime_root": str(self.root), "opencode_port": 3002}
+        (self.root / "server-password").write_text("test-password")
+        self.credentials = patch.dict(os.environ, CREDENTIALS_DIRECTORY=str(self.root))
+        self.credentials.start()
+        self.addCleanup(self.credentials.stop)
+        self.sessions = {}
+        self.lookups = []
         self.requests = asyncio.Queue()
         self.disconnected = asyncio.Queue()
         app = web.Application(client_max_size=module.MAX_REQUEST * 2)
@@ -115,10 +121,27 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
 
+        async def session(request):
+            self.assertEqual(
+                request.headers.get("Authorization"),
+                "Basic b3BlbmNvZGU6dGVzdC1wYXNzd29yZA==",
+            )
+            session_id = request.match_info["id"]
+            self.lookups.append(session_id)
+            data = self.sessions.get(
+                session_id,
+                {"id": session_id, "location": {"directory": self.frontend.directory}},
+            )
+            if data is None:
+                raise web.HTTPNotFound()
+            return web.json_response({"data": data})
+
+        app.router.add_get("/api/session/{id}", session)
         app.router.add_post("/mcp", manager)
         self.runner = web.AppRunner(app, handler_cancellation=True)
         await self.runner.setup()
         await web.UnixSite(self.runner, str(self.root / "control.sock")).start()
+        await web.TCPSite(self.runner, "127.0.0.1", 3002).start()
         self.frontend = module.Frontend(self.config, copy.deepcopy(CATALOG))
         self.reader = asyncio.StreamReader(limit=module.MAX_REQUEST)
         self.writer = Writer()
@@ -160,7 +183,8 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
             "tools/call",
             {
                 "name": "browser_navigate",
-                "arguments": {module.SESSION_FIELD: session, "url": url, **arguments},
+                "arguments": {"url": url, **arguments},
+                "_meta": {module.SESSION_FIELD: session},
             },
             id=id,
         )
@@ -199,16 +223,20 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_routing_stripping_and_pinned_directory(self):
         await self.initialize()
-        with patch.object(
-            module.os, "getcwd", return_value="/model/cannot/change/cwd"
-        ), patch.object(
-            module.asyncio,
-            "create_subprocess_exec",
-            side_effect=AssertionError("runtime launch forbidden"),
+        with (
+            patch.object(module.os, "getcwd", return_value="/model/cannot/change/cwd"),
+            patch.object(
+                module.asyncio,
+                "create_subprocess_exec",
+                side_effect=AssertionError("runtime launch forbidden"),
+            ),
         ):
             for index, session in enumerate(("ses_one", "ses_two"), 1):
                 self.call(
-                    id=index, session=session, code="arbitrary text is only proxied"
+                    id=index,
+                    session=session,
+                    code="arbitrary text is only proxied",
+                    __opencode_session_id="ses_forged",
                 )
                 result = await self.response()
                 body = await self.requests.get()
@@ -233,11 +261,53 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.frontend.directory, os.getcwd())
         self.assertEqual(self.frontend.catalog, CATALOG)
 
+    async def test_subagent_uses_root_runtime(self):
+        await self.initialize()
+        self.sessions["ses_child"] = {
+            "id": "ses_child",
+            "parentID": "ses_root",
+            "location": {"directory": os.getcwd()},
+        }
+        self.call(session="ses_child", __opencode_session_id="ses_forged")
+        self.assertIn("result", await self.response())
+        body = await self.requests.get()
+        self.assertEqual(body["session_id"], "ses_root")
+        self.assertEqual(
+            body["request"]["params"]["arguments"], {"url": "https://example.com"}
+        )
+        self.assertEqual(self.lookups, ["ses_child", "ses_root"])
+
+    async def test_invalid_ancestry_never_reaches_manager(self):
+        await self.initialize()
+        for data in (
+            None,
+            {"id": "ses_other", "location": {"directory": os.getcwd()}},
+            {"id": "ses_one", "location": {"directory": "/other"}},
+            {
+                "id": "ses_one",
+                "parentID": "ses_one",
+                "location": {"directory": os.getcwd()},
+            },
+            {
+                "id": "ses_one",
+                "parentID": "../other",
+                "location": {"directory": os.getcwd()},
+            },
+        ):
+            self.sessions["ses_one"] = data
+            self.call()
+            self.assertEqual(
+                (await self.response())["error"]["message"],
+                "OpenCode session routing failed",
+            )
+        self.assertTrue(self.requests.empty())
+
     async def test_invalid_arguments_metadata_and_names_do_not_reach_manager(self):
         await self.initialize()
         good = {
             "name": "browser_navigate",
-            "arguments": {module.SESSION_FIELD: "ses_one"},
+            "arguments": {},
+            "_meta": {module.SESSION_FIELD: "ses_one"},
         }
         invalid = [
             None,
@@ -246,7 +316,11 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
             {**good, "name": []},
             {**good, "name": "browser_unknown"},
             {**good, "arguments": []},
-            {**good, "arguments": {}},
+            {**good, "_meta": {}},
+            {
+                "name": "browser_navigate",
+                "arguments": {"__opencode_session_id": "ses_forged"},
+            },
             {**good, "directory": "/tmp"},
             {**good, "_meta": []},
             {**good, "arguments": {**good["arguments"], "directory": "/tmp"}},
@@ -262,7 +336,7 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
             "ses_one\n",
             "ses_" + "a" * 125,
         ):
-            invalid.append({**good, "arguments": {module.SESSION_FIELD: session}})
+            invalid.append({**good, "_meta": {module.SESSION_FIELD: session}})
         for params in invalid:
             self.feed("tools/call", params)
             self.assertEqual((await self.response())["error"]["code"], -32602, params)
@@ -437,7 +511,8 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
                     "tools/call",
                     {
                         "name": "browser_navigate",
-                        "arguments": {module.SESSION_FIELD: "ses_cli", "url": "hang"},
+                        "arguments": {"url": "hang"},
+                        "_meta": {module.SESSION_FIELD: "ses_cli"},
                     },
                 ),
             ):

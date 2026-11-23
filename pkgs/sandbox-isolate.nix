@@ -1,4 +1,8 @@
-{ pkgs, sandboxRuntime }:
+{
+  pkgs,
+  sandboxRuntime,
+  bubblewrap ? pkgs.bubblewrap,
+}:
 let
   helper = "${sandboxRuntime}/lib/node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/${
     if pkgs.stdenv.hostPlatform.isx86_64 then "x64" else "arm64"
@@ -18,7 +22,7 @@ pkgs.writeShellApplication {
     bundle="''${SSL_CERT_FILE:?missing sandbox trust bundle}"
     [[ -f "$bundle" && ! -L "$bundle" ]] || exit 77
     args=(
-      --die-with-parent --unshare-user --cap-drop ALL
+      --die-with-parent --unshare-user --unshare-pid --cap-drop ALL
       --ro-bind /nix/store /nix/store
       --ro-bind-try /sys /sys
       --dev /dev --proc /proc
@@ -61,8 +65,13 @@ pkgs.writeShellApplication {
     # bwrap closes non-stdio inherited descriptors. The relays keep their own
     # mount view and can open broker sockets for every subsequent connection.
     # No network unshare here: retain the session loopback and proxy listeners.
-    exec ${pkgs.bubblewrap}/bin/bwrap "''${args[@]}" \
+    # The proc mount belongs to this new PID/user namespace pair. The native
+    # helper can then require its own fresh procfs even under systemd masks.
+    # Nested workload namespaces retain the outer filesystem/seccomp limits;
+    # browsers need them, and their inheritance is checked by the MCP tests.
+    exec ${bubblewrap}/bin/bwrap "''${args[@]}" \
       --remount-ro / --chdir "$PWD" \
+      --setenv SRT_ALLOW_NESTED_USERNS 1 \
       --unsetenv OPENCODE_SANDBOX_WORKSPACE -- \
       ${helper} --allow-unix-sockets "$@"
   '';

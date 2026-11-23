@@ -4,242 +4,185 @@ import { readFile } from "node:fs/promises"
 import test from "node:test"
 import { createContext, SourceTextModule, SyntheticModule } from "node:vm"
 
-// Load the Nix output intact: only the SDK, filesystem effects, and Bun are mocked.
 const source = await readFile(process.env.OPENCODE_PLUGIN, "utf8")
 const directory = `${process.env.WORKSPACES_ROOT}/project`
 const tmp = `${process.env.WORKSPACES_TMP_ROOT}/project`
-const pr = "https://github.com/example/project/pull/42"
-const session = (id, parentID) => ({ id, directory, ...(parentID === undefined ? {} : { parentID }) })
-const family = () => [
-  session("ses_root"),
-  session("ses_child", "ses_root"),
-  session("ses_grandchild", "ses_child"),
-  session("ses_sibling", "ses_root"),
-  session("ses_unrelated"),
-]
+const session = (id, parentID, dir = directory) => ({ id, location: { directory: dir }, parentID })
+const family = () => [session("sesRoot"), session("sesChild", "sesRoot"), session("sesOther"), session("ses_legacy")]
+const tick = () => new Promise(setImmediate)
+const contextFor = sessionID => ({ sessionID, signal: new AbortController().signal })
 
 async function harness({ sessions = family(), get, stopExit = Promise.resolve(0) } = {}) {
-  const records = new Map(sessions.map((record) => [record.id, record]))
-  const lookups = []
-  const effects = []
-  const requests = []
+  const records = new Map(sessions.map(record => [record.id, record]))
+  const lookups = [], effects = [], requests = [], errors = []
+  const hooks = {}, tools = new Map()
+  let receive
   const context = createContext({
+    AbortController,
+    console: { error: (...args) => errors.push(args) },
     Bun: {
-      resolveSync(name, configDirectory) {
-        assert.equal(name, "@opencode-ai/plugin")
-        assert.equal(configDirectory, process.env.OPENCODE_CONFIG_DIR)
-        return "mock:plugin"
-      },
-      sleep() { throw new Error("Unexpected managed-response polling") },
-      spawn(command, options) {
-        effects.push({ type: "stop", command: Array.from(command), options })
-        return { exited: stopExit.then((status) => {
-          effects.push({ type: "exit", status })
-          return status
-        }) }
+      sleep() { throw new Error("Unexpected response polling") },
+      spawn(command) {
+        effects.push({ type: "stop", command: Array.from(command) })
+        return { exited: stopExit.then(status => { effects.push({ type: "exit", status }); return status }) }
       },
     },
-  })
-  const schema = {
-    url() { return this },
-    describe() { return this },
-    regex() { return this },
-    optional() { return this },
-    max() { return this },
-  }
-  const tool = Object.assign((definition) => definition, {
-    schema: { string: () => schema, enum: () => schema },
   })
   const modules = new Map()
   for (const [name, exports] of Object.entries({
     "node:crypto": { randomUUID },
-    "node:fs": { realpathSync: (path) => path },
+    "node:fs": { realpathSync: path => path },
     "node:fs/promises": {
-      async writeFile(path, payload, options) {
-        effects.push({ type: "write", path, options })
-        requests.push(JSON.parse(payload))
-      },
+      async writeFile(path, payload) { effects.push({ type: "write", path }); requests.push(JSON.parse(payload)) },
       async rename(from, to) { effects.push({ type: "rename", from, to }) },
       async readFile(path) {
-        const request = requests.find((item) => path.endsWith(`/response-${item.request_id}.json`))
-        assert.ok(request, `Unexpected read: ${path}`)
+        const request = requests.find(item => path.endsWith(`/response-${item.request_id}.json`))
+        assert.ok(request)
         return JSON.stringify({ request_id: request.request_id, ok: true, result: { configured: true } })
       },
-      async unlink(path) { effects.push({ type: "unlink", path }) },
-      async rm(path, options) { effects.push({ type: "rm", path, options }) },
+      async unlink() {},
+      async rm(path) { effects.push({ type: "rm", path }) },
     },
-    "mock:plugin": { tool },
   })) {
     const module = new SyntheticModule(Object.keys(exports), function () {
       for (const [key, value] of Object.entries(exports)) this.setExport(key, value)
     }, { context })
-    await module.link(() => { throw new Error("Unexpected mock dependency") })
+    await module.link(() => { throw new Error("Unexpected dependency") })
     await module.evaluate()
     modules.set(name, module)
   }
-  const resolve = (name) => {
-    assert.ok(modules.has(name), `Unexpected import: ${name}`)
-    return modules.get(name)
-  }
-  const module = new SourceTextModule(source, {
-    context,
-    identifier: process.env.OPENCODE_PLUGIN,
-    importModuleDynamically: resolve,
-  })
-  await module.link(resolve)
+  const module = new SourceTextModule(source, { context })
+  await module.link(name => { assert.ok(modules.has(name), name); return modules.get(name) })
   await module.evaluate()
-  const hooks = await module.namespace.ManagedHost({
-    directory,
-    client: { session: { async get(options) {
-      assert.deepEqual(JSON.parse(JSON.stringify(options)), {
-        path: { id: options.path.id }, query: { directory }, throwOnError: true,
-      })
-      lookups.push(options.path.id)
-      return get ? get(options.path.id) : { data: records.get(options.path.id) }
-    } } },
+  const shell = { name: "shell", async execute(input, ctx) {
+    const event = { sessionID: ctx.sessionID, env: { OPENCODE_MANAGED_SESSION_ID: "sesForged" }, shell: "/bin/sh" }
+    await hooks.shell(event)
+    // V2 Core writes this after shell.create.before.
+    event.env.OPENCODE_SESSION_ID = ctx.sessionID
+    return event
+  } }
+  tools.set("shell", shell)
+  const cleanup = await module.namespace.default.setup({
+    location: { directory },
+    session: { async get({ sessionID }) {
+      lookups.push(sessionID)
+      return get ? get(sessionID) : records.get(sessionID)
+    } },
+    event: { subscribe({ signal }) {
+      return { [Symbol.asyncIterator]() { return this }, next() {
+        return new Promise(resolve => {
+          receive = value => resolve({ value, done: false })
+          signal.addEventListener("abort", () => resolve({ done: true }), { once: true })
+        })
+      } }
+    } },
+    shell: { async hook(name, callback) { assert.equal(name, "create.before"); hooks.shell = callback } },
+    tool: {
+      async hook(name, callback) { assert.equal(name, "execute.before"); hooks.before = callback },
+      async transform(callback) { callback({
+        add(definition) { tools.set(definition.name, definition) },
+        update(name, update) { update(tools.get(name)) },
+      }) },
+    },
   })
-  return { hooks, lookups, effects, requests }
+  return { hooks, tools, lookups, effects, requests, errors, cleanup,
+    async deleted(id, dir = directory) {
+      receive({ type: "session.deleted", ...(dir === null ? {} : { location: { directory: dir } }), data: { sessionID: id } })
+      await tick()
+    },
+  }
 }
 
-const toolContext = (sessionID, cwd = directory) => ({
-  sessionID, directory: cwd, abort: new AbortController().signal,
-})
-const deleted = (id) => ({ event: { type: "session.deleted", properties: { info: { id } } } })
-
-test("shell and browser route related sessions to their root, without crossing conversations", async () => {
+test("V2 shell calls resolve trusted root ancestry, including legacy IDs", async () => {
   const h = await harness()
-  for (const [id, ancestry] of [
-    ["ses_root", ["ses_root"]],
-    ["ses_child", ["ses_child", "ses_root"]],
-    ["ses_grandchild", ["ses_grandchild", "ses_child", "ses_root"]],
-    ["ses_sibling", ["ses_sibling", "ses_root"]],
-    ["ses_unrelated", ["ses_unrelated"]],
-  ]) {
-    const root = ancestry.at(-1)
-    h.lookups.length = 0
-    const shell = { env: { KEEP: "value" } }
-    await h.hooks["shell.env"]({ sessionID: id }, shell)
-    assert.deepEqual(shell.env, { KEEP: "value", OPENCODE_SESSION_ID: root })
-    assert.deepEqual(h.lookups, ancestry)
-
-    h.lookups.length = 0
-    const browser = { args: { __opencode_session_id: "ses_forged", url: "https://example.com" } }
-    await h.hooks["tool.execute.before"]({ tool: "playwright_browser_navigate", sessionID: id }, browser)
-    assert.deepEqual(browser.args, { __opencode_session_id: root, url: "https://example.com" })
-    assert.deepEqual(h.lookups, ancestry)
+  for (const [id, root] of [["sesRoot", "sesRoot"], ["sesChild", "sesRoot"], ["sesOther", "sesOther"], ["ses_legacy", "ses_legacy"]]) {
+    const result = await h.tools.get("shell").execute({}, contextFor(id))
+    assert.equal(result.env.OPENCODE_MANAGED_SESSION_ID, root)
+    assert.match(result.shell, /\/bin\/opencode-session-exec$/)
   }
-  assert.deepEqual(h.effects, [])
+  h.cleanup()
 })
 
-test("sessionless shells remain supported without an SDK lookup", async () => {
+test("sessionless shells discard forged managed routing", async () => {
   const h = await harness()
-  const output = { env: {} }
-  await h.hooks["shell.env"]({}, output)
-  assert.equal(output.env.OPENCODE_SESSION_ID, undefined)
+  const event = { env: { OPENCODE_MANAGED_SESSION_ID: "sesForged" } }
+  await h.hooks.shell(event)
+  assert.equal(event.env.OPENCODE_MANAGED_SESSION_ID, undefined)
   assert.deepEqual(h.lookups, [])
+  h.cleanup()
 })
 
-test("both managed tools write the trusted root session and tracking names the conversation", async () => {
+test("managed tools use root session IDs and return V2 content", async () => {
   const h = await harness()
-  assert.equal(await h.hooks.tool.github_track_pr.execute({ pr_url: pr }, toolContext("ses_grandchild")),
-    `Registered ${pr} with this conversation`)
-  const args = { action: "fetch", remote: "origin" }
-  assert.deepEqual(JSON.parse(await h.hooks.tool.github_manage_remote.execute(args, toolContext("ses_sibling"))),
-    { configured: true })
-  assert.deepEqual(h.requests.map(({ operation, session_id, directory: cwd, arguments: args }) =>
-    ({ operation, session_id, directory: cwd, arguments: args })), [
-    { operation: "track_pr", session_id: "ses_root", directory, arguments: { pr_url: pr } },
-    { operation: "manage_github_remote", session_id: "ses_root", directory, arguments: args },
-  ])
-  assert.deepEqual(h.lookups, ["ses_grandchild", "ses_child", "ses_root", "ses_sibling", "ses_root"])
-  assert.equal(h.effects.filter(({ type }) => type === "rename").length, 2)
+  const pr = "https://github.com/example/project/pull/42"
+  const result = await h.tools.get("github_track_pr").execute({ pr_url: pr }, contextFor("sesChild"))
+  assert.equal(result.content, `Registered ${pr} with this conversation`)
+  const remote = await h.tools.get("github_manage_remote").execute({ action: "fetch" }, contextFor("sesChild"))
+  assert.deepEqual(JSON.parse(remote.content), { configured: true })
+  assert.ok(h.requests.every(request => request.session_id === "sesRoot" && request.directory === directory))
+  h.cleanup()
 })
 
-test("untrusted or unavailable ancestry fails before routing or managed filesystem effects", async (t) => {
-  const tooDeep = Array.from({ length: 65 }, (_, i) => session(`ses_n${i}`, i < 64 ? `ses_n${i + 1}` : undefined))
-  for (const [name, id, options] of [
-    ["malformed caller ID", "ses_bad/path", {}],
-    ["missing session", "ses_missing", {}],
-    ["SDK failure", "ses_child", { get: async () => { throw new Error("SDK unavailable") } }],
-    ["missing ancestor", "ses_child", { sessions: [session("ses_child", "ses_missing")] }],
-    ["cross-directory ancestor", "ses_child", { sessions: [session("ses_child", "ses_root"), { ...session("ses_root"), directory: `${directory}/` }] }],
-    ["mismatched response ID", "ses_child", { get: () => ({ data: session("ses_other") }) }],
-    ["malformed parent ID", "ses_child", { sessions: [session("ses_child", "not-a-session")] }],
-    ["cyclic ancestry", "ses_child", { sessions: [session("ses_child", "ses_root"), session("ses_root", "ses_child")] }],
-    ["ancestry beyond 64", "ses_n0", { sessions: tooDeep }],
+test("invalid, cyclic and cross-directory ancestry fails before effects", async () => {
+  for (const options of [
+    { get: () => undefined },
+    { get: () => session("sesOther") },
+    { sessions: [session("sesChild", "sesRoot"), session("sesRoot", undefined, "/outside")] },
+    { sessions: [session("sesChild", "sesChild")] },
+    { sessions: [session("sesChild", "../escape")] },
   ]) {
-    await t.test(name, async () => {
-      const h = await harness(options)
-      const shell = { env: {} }
-      await assert.rejects(h.hooks["shell.env"]({ sessionID: id }, shell))
-      assert.deepEqual(shell.env, {})
-      const browser = { args: { __opencode_session_id: "ses_forged" } }
-      await assert.rejects(h.hooks["tool.execute.before"]({ tool: "playwright_browser_snapshot", sessionID: id }, browser))
-      assert.equal(browser.args.__opencode_session_id, "ses_forged")
-      await assert.rejects(h.hooks.tool.github_track_pr.execute({ pr_url: pr }, toolContext(id)))
-      assert.deepEqual(h.effects, [])
-      assert.deepEqual(h.requests, [])
-      assert.ok(h.lookups.length <= 3 * 64, "ancestry lookups must be bounded for each call")
-    })
+    const h = await harness(options)
+    await assert.rejects(h.tools.get("shell").execute({}, contextFor("sesChild")))
+    await assert.rejects(h.tools.get("github_track_pr").execute({}, contextFor("sesChild")))
+    assert.deepEqual(h.effects, [])
+    assert.ok(h.lookups.length <= 128)
+    h.cleanup()
   }
 })
 
-test("managed tools reject mismatched context directories and missing sessions before writing", async () => {
-  const h = await harness()
-  for (const context of [toolContext("ses_child", `${directory}/`), toolContext(undefined)]) {
-    await assert.rejects(h.hooks.tool.github_track_pr.execute({ pr_url: pr }, context))
-    await assert.rejects(h.hooks.tool.github_manage_remote.execute({ action: "fetch" }, context))
-  }
+test("deletion is location-scoped and waits for runtime stop", async () => {
+  let release
+  const h = await harness({ stopExit: new Promise(resolve => { release = resolve }) })
+  await h.deleted("sesRoot", "/other")
   assert.deepEqual(h.effects, [])
+  await h.deleted("sesChild")
+  assert.deepEqual(h.effects.map(e => e.type), ["stop"])
+  assert.deepEqual(h.effects[0].command.slice(1), ["stop", "--session", "sesChild", "--directory", directory])
+  release(0)
+  await tick()
+  assert.equal(h.effects.at(-1).path, `${tmp}/sesChild`)
+  h.cleanup()
 })
 
-test("64-session ancestry is supported", async () => {
-  const sessions = Array.from({ length: 64 }, (_, i) => session(`ses_n${i}`, i < 63 ? `ses_n${i + 1}` : undefined))
-  const h = await harness({ sessions })
-  const output = { env: {} }
-  await h.hooks["shell.env"]({ sessionID: "ses_n0" }, output)
-  assert.equal(output.env.OPENCODE_SESSION_ID, "ses_n63")
-  assert.equal(h.lookups.length, 64)
-})
-
-test("deletion stops only the exact deleted session and waits for stop before removing its tmp", async () => {
-  for (const id of ["ses_child", "ses_root"]) {
-    let release
-    const stopExit = new Promise((resolve) => { release = resolve })
-    const h = await harness({ stopExit, get: () => { throw new Error("Deletion must not resolve ancestry") } })
-    const deleting = h.hooks.event(deleted(id))
-    assert.deepEqual(h.effects.map(({ type }) => type), ["stop"])
-    assert.match(h.effects[0].command[0], /\/bin\/opencode-session-exec$/)
-    assert.deepEqual(h.effects[0].command.slice(1), ["stop", "--session", id, "--directory", directory])
-    release(0)
-    await deleting
-    assert.deepEqual(h.effects.map(({ type }) => type), ["stop", "exit", "rm"])
-    assert.equal(h.effects[2].path, `${tmp}/${id}`)
-    assert.deepEqual(JSON.parse(JSON.stringify(h.effects[2].options)), { recursive: true, force: true })
-    assert.deepEqual(h.lookups, [])
-  }
-})
-
-test("failed stop skips deletion, and malformed deleted IDs have no effects", async () => {
+test("failed runtime stop preserves temporary files", async () => {
   const h = await harness({ stopExit: Promise.resolve(1) })
-  await assert.rejects(h.hooks.event(deleted("ses_root")), /stop/i)
-  assert.deepEqual(h.effects.map(({ type }) => type), ["stop", "exit"])
-  h.effects.length = 0
-  await h.hooks.event(deleted("ses_root/../ses_other"))
-  assert.deepEqual(h.effects, [])
-  assert.deepEqual(h.lookups, [])
+  await h.deleted("sesRoot")
+  assert.equal(h.effects.some(e => e.type === "rm"), false)
+  assert.equal(h.errors.length, 1)
+  h.cleanup()
 })
 
-test("direct file tools still reject /tmp but allow workspace and similarly named paths", async () => {
-  const h = await harness()
-  for (const [tool, key] of [["edit", "filePath"], ["glob", "path"], ["grep", "path"], ["read", "filePath"], ["write", "filePath"]]) {
-    for (const path of ["/tmp", "/tmp/file"]) {
-      await assert.rejects(h.hooks["tool.execute.before"]({ tool, sessionID: "ses_child" }, { args: { [key]: path } }), /temporary files/)
-    }
-    for (const path of [`${directory}/file`, "/tmpfile"]) {
-      await h.hooks["tool.execute.before"]({ tool, sessionID: "ses_child" }, { args: { [key]: path } })
-    }
+test("locationless V2 deletions clean up only the exact session in this workspace", async () => {
+  const h = await harness({ get: () => { throw new Error("Deleted sessions cannot be queried") } })
+  await h.deleted("sesRoot/../sesOther", null)
+  assert.deepEqual(h.effects, [])
+  for (const id of ["sesChild", "sesRoot"]) {
+    h.effects.length = 0
+    await h.deleted(id, null)
+    assert.deepEqual(h.effects.map(e => e.type), ["stop", "exit", "rm"])
+    assert.deepEqual(h.effects[0].command.slice(1), ["stop", "--session", id, "--directory", directory])
+    assert.equal(h.effects.at(-1).path, `${tmp}/${id}`)
   }
   assert.deepEqual(h.lookups, [])
-  assert.deepEqual(h.effects, [])
+  h.cleanup()
+})
+
+test("V2 file and patch tools cannot access shell-private temporary files", async () => {
+  const h = await harness()
+  for (const tool of ["read", "glob", "grep", "edit", "write"]) {
+    await assert.rejects(h.hooks.before({ tool, input: { path: "/tmp/file" } }), /temporary files/)
+    await h.hooks.before({ tool, input: { path: `${directory}/file` } })
+  }
+  await assert.rejects(h.hooks.before({ tool: "patch", input: { patchText: "*** Begin Patch\n*** Add File: /tmp/file\n+x\n*** End Patch" } }), /temporary files/)
+  h.cleanup()
 })

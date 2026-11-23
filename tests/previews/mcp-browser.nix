@@ -2,6 +2,7 @@
   pkgs,
   sandboxRuntime,
   sandboxIsolate,
+  bubblewrap ? pkgs.bubblewrap,
   playwrightMcp ? import ../../pkgs/playwright-mcp.nix { inherit pkgs; },
 }:
 let
@@ -20,7 +21,7 @@ let
         allowLocalBinding = false;
         tlsTerminate = { };
       };
-      bwrapPath = "${pkgs.bubblewrap}/bin/bwrap";
+      bwrapPath = "${bubblewrap}/bin/bwrap";
       socatPath = "${pkgs.socat}/bin/socat";
       seccomp.applyPath = "${sandboxIsolate}/bin/opencode-sandbox-isolate";
       ripgrep.command = "${pkgs.ripgrep}/bin/rg";

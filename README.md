@@ -13,7 +13,7 @@ flake.
 ## Objectives
 
 - Use stable NixOS 26.05 as the base and pin every flake input in `flake.lock`.
-- Use unstable nixpkgs only for Fish 4.8, OpenCode, and Sandbox Runtime.
+- Use unstable nixpkgs only for Fish, OpenCode, Sandbox Runtime, and Bubblewrap.
 - Expose one password-protected OpenCode server through Cloudflare Tunnel at
   `https://opencode.example.com`, with no public origin port or nginx.
 - Give the agent broad development tooling without general sudo access.
@@ -105,15 +105,18 @@ With previews enabled, managed OpenCode configuration enables the `playwright`
 MCP server. The MCP package and matching Chromium headless shell (Blink), Firefox
 (Gecko), and WebKit come from pinned stable nixpkgs; no runtime npm installation
 or browser download is needed. Chromium is the default. Call
-`playwright_browser_select` with `{"browser":"firefox"}`, `{"browser":"webkit"}`,
+`tools.playwright.browser_select` with `{"browser":"firefox"}`, `{"browser":"webkit"}`,
 or `{"browser":"chromium"}` to select the engine for the current session runtime.
 Changing engines closes the old browser and removes its state and output files;
 selecting the current engine preserves them. Other sessions are unaffected.
 The choice survives browser closure/errors but resets when the runtime expires.
 
-OpenCode shares MCP connections across conversations, so the managed plugin
-adds trusted session routing metadata to each `playwright_*` tool call. A
-stdio adapter forwards it over the existing private runtime control socket.
+OpenCode shares MCP connections across conversations and supplies the calling
+session in MCP `_meta["ai.opencode/sessionID"]`. The stdio adapter resolves its
+root conversation through the authenticated OpenCode API, checks that each
+ancestor belongs to the adapter's workspace, and forwards the root session ID
+over the existing private runtime control socket. Model-supplied arguments
+cannot override this routing.
 Upstream tool schemas are captured at build time, with a local browser-selection
 tool added to the catalog; no browser or upstream tool code runs in the host
 adapter. The runtime supervisor owns a separate persistent MCP child for each
@@ -229,7 +232,7 @@ These controls contain common prompt-injection outcomes such as credential
 theft, workspace escape, host persistence, sudo use, and Docker-socket escape.
 They do not stop an agent from changing workspace code, using allowed GitHub
 operations, or disclosing workspace content through permitted tools. Never put
-secrets in a workspace. Global/instance LSPs, formatters, and built-in web tools
+secrets in a workspace. Global/instance formatters and built-in web tools
 remain outside the shell sandbox. The trusted in-sandbox session supervisor can
 be killed by its own session's code, causing denial of service to that runtime;
 this does not grant access to other sessions.
@@ -335,8 +338,10 @@ nix --extra-experimental-features nix-command \
 df -h /nix/store
 ```
 
-Keep at least 15 GiB free on the filesystem containing `/nix/store`; this
-configuration includes several large development toolchains.
+Allow at least 40 GiB free on the filesystem containing `/nix/store` for a
+clean full build. This configuration includes several large development
+toolchains, and building OpenCode temporarily copies over 4 GiB of dependencies.
+An already populated store needs less additional space.
 
 Use `--store daemon` on each daemon-backed command. Alternatively, set
 `NIX_REMOTE=daemon` in the shell and omit that option:
@@ -464,7 +469,7 @@ Configure models in `hosts/opencode/settings.nix`:
 | `defaultModel` | `openai/gpt-6-astra` |
 | `githubBridge.model` | `openai/gpt-6-astra` |
 
-List available IDs with `sudo -iu <BOT_USER> opencode models` and rebuild after
+List available IDs with `sudo -iu <BOT_USER> opencode models --standalone` and rebuild after
 changing these settings. Explicit session selections take precedence over the
 OpenCode default. The bridge uses its configured model for each dispatch and
 leaves events pending if that model is unavailable.
@@ -477,7 +482,6 @@ a new conversation or browser reload. To reload them, wait for active agent work
 to finish, then run on the VPS:
 
 ```bash
-sudo -iu <BOT_USER> opencode models --refresh
 sudo systemctl restart opencode.service
 ```
 
@@ -818,9 +822,12 @@ to log in to the VPS.
 
 ## 7. Connect ChatGPT Pro
 
-OpenCode stores provider OAuth state in
-`/home/<BOT_USER>/.local/share/opencode/auth.json`. It is not Nix-managed and
-the command sandbox cannot read it.
+OpenCode stores credentials and session data under
+`/home/<BOT_USER>/.local/share/opencode`. V2 migrates existing V1 credentials;
+this state is not Nix-managed and the command sandbox cannot read it.
+The service and maintenance CLI use V2's default `opencode.db`. Existing hosts
+must rename the previous package's `opencode-stable.db` and its SQLite sidecars
+while OpenCode is stopped, as described in the upgrade procedure below.
 
 Use OpenCode's headless device flow; it does not require port forwarding.
 Connect to the VPS normally, stop the server, and run login from the bot's
@@ -834,9 +841,8 @@ On the VPS:
 
 ```bash
 sudo systemctl stop opencode
-sudo -iu <BOT_USER> opencode auth login \
-  --provider openai \
-  --method 'ChatGPT Pro/Plus (headless)'
+sudo -iu <BOT_USER> opencode auth login openai --standalone \
+  --method chatgpt-headless
 sudo systemctl start opencode
 ```
 
@@ -857,7 +863,7 @@ Check the local server without exposing the password on a command line:
 ```bash
 sudo bash -c '
   password=$(< /var/lib/opencode-secrets/server-password)
-  curl --fail --user "opencode:$password" http://127.0.0.1:4096/global/health
+    curl --fail --user "opencode:$password" http://127.0.0.1:4096/api/info
 '
 ```
 

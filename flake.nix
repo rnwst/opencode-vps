@@ -100,6 +100,7 @@
         };
         playwright-mcp = import ./tests/previews/mcp-browser.nix {
           inherit pkgs;
+          inherit (localPackages) bubblewrap;
           sandboxRuntime = localPackages.sandbox-runtime;
           playwrightMcp = localPackages.playwright-mcp;
           sandboxIsolate = localPackages.sandbox-isolate;

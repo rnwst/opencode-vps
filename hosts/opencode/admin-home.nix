@@ -41,10 +41,9 @@
             return $read_status
         end
 
-        set -lx OPENCODE_SERVER_USERNAME opencode
-        set -lx OPENCODE_SERVER_PASSWORD "$password"
-        command opencode attach http://127.0.0.1:${toString settings.opencodePort} \
-            --dir "$directory" $argv
+        set -lx OPENCODE_PASSWORD "$password"
+        command opencode --server http://127.0.0.1:${toString settings.opencodePort} \
+            "$directory" $argv
       '';
       shellAbbrs = {
         ocw = "sudo opencode-workspace";

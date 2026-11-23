@@ -1,6 +1,7 @@
 """Native stdio MCP proxy; only the explicit build-time catalog mode spawns code."""
 
 import asyncio
+import base64
 import contextlib
 import json
 import math
@@ -19,8 +20,8 @@ HTTP_TIMEOUT = 130
 OUTPUT_TIMEOUT = 5
 CATALOG_TIMEOUT = 30
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
-SESSION_FIELD = "__opencode_session_id"
-SESSION = re.compile(r"ses_[A-Za-z0-9]{1,124}\Z")
+SESSION_FIELD = "ai.opencode/sessionID"
+SESSION = re.compile(r"ses_?[A-Za-z0-9]{1,124}\Z")
 
 
 def encode(value):
@@ -114,6 +115,50 @@ class Frontend:
         self.initialized = False
         self.pending = {}
         self.output_lock = asyncio.Lock()
+        self.opencode_port = config.get("opencode_port", 4096)
+
+    async def root_session(self, session_id):
+        password = (
+            (Path(os.environ["CREDENTIALS_DIRECTORY"]) / "server-password")
+            .read_text()
+            .strip()
+        )
+        async with aiohttp.ClientSession(
+            headers={
+                "Authorization": "Basic "
+                + base64.b64encode(f"opencode:{password}".encode()).decode()
+            },
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as client:
+            seen = set()
+            async with asyncio.timeout(10):
+                while len(seen) < 64:
+                    if (
+                        not isinstance(session_id, str)
+                        or not SESSION.fullmatch(session_id)
+                        or session_id in seen
+                    ):
+                        raise ValueError("Invalid OpenCode session ancestry")
+                    seen.add(session_id)
+                    async with client.get(
+                        f"http://127.0.0.1:{self.opencode_port}/api/session/{session_id}",
+                        allow_redirects=False,
+                    ) as response:
+                        if response.status != 200:
+                            raise ValueError("OpenCode session lookup failed")
+                        payload = await response.json()
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if (
+                        not isinstance(data, dict)
+                        or data.get("id") != session_id
+                        or not isinstance(data.get("location"), dict)
+                        or data.get("location", {}).get("directory") != self.directory
+                    ):
+                        raise ValueError("OpenCode session workspace mismatch")
+                    if "parentID" not in data:
+                        return session_id
+                    session_id = data["parentID"]
+        raise ValueError("OpenCode session ancestry is too deep")
 
     async def send(self, writer, id, body):
         data = encode({"jsonrpc": "2.0", "id": id, **body}) + b"\n"
@@ -146,9 +191,10 @@ class Frontend:
         ):
             return error(-32602, "Invalid tool name or arguments")
         arguments = dict(params["arguments"])
-        session_id = arguments.pop(SESSION_FIELD, None)
-        # This is routing metadata, not authentication. The managed plugin must
-        # overwrite any model-supplied value after schema validation.
+        session_id = params.get("_meta", {}).get(SESSION_FIELD)
+        # OpenCode supplies this outside model-controlled tool arguments.
+        # Discard the obsolete argument so it cannot select a runtime or leak.
+        arguments.pop("__opencode_session_id", None)
         if not isinstance(session_id, str) or not SESSION.fullmatch(session_id):
             return error(-32602, "Missing or invalid OpenCode session metadata")
         if "directory" in arguments:
@@ -157,6 +203,17 @@ class Frontend:
             "method": "tools/call",
             "params": {"name": params["name"], "arguments": arguments},
         }
+        try:
+            session_id = await self.root_session(session_id)
+        except (
+            aiohttp.ClientError,
+            OSError,
+            TimeoutError,
+            ValueError,
+            KeyError,
+            TypeError,
+        ):
+            return error(-32000, "OpenCode session routing failed")
         try:
             data = encode(request)
             if len(data) > MAX_REQUEST:

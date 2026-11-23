@@ -1,0 +1,33 @@
+diff --git a/packages/core/src/shell.ts b/packages/core/src/shell.ts
+--- a/packages/core/src/shell.ts
++++ b/packages/core/src/shell.ts
+@@ -887,6 +887,7 @@
+             ? undefined
+             : ((Schema.is(SessionSchema.ID)(sessionID) ? yield* environments.get(sessionID) : undefined) ?? process.env)
+         const invocation: ShellCreateBefore = {
++          sessionID: Schema.is(SessionSchema.ID)(sessionID) ? sessionID : undefined,
+           command: input.command,
+           cwd: input.cwd ?? location.directory,
+           timeout: input.timeout ?? 0,
+diff --git a/packages/plugin/src/effect/shell.ts b/packages/plugin/src/effect/shell.ts
+--- a/packages/plugin/src/effect/shell.ts
++++ b/packages/plugin/src/effect/shell.ts
+@@ -1,6 +1,7 @@
+ import type { Hooks } from "./registration.js"
+
+ export interface ShellCreateBefore {
++  readonly sessionID?: string
+   command: string
+   cwd: string
+   timeout: number
+diff --git a/packages/plugin/src/promise/shell.ts b/packages/plugin/src/promise/shell.ts
+--- a/packages/plugin/src/promise/shell.ts
++++ b/packages/plugin/src/promise/shell.ts
+@@ -1,6 +1,7 @@
+ import type { Hooks } from "./registration.js"
+
+ export interface ShellCreateBefore {
++  readonly sessionID?: string
+   command: string
+   cwd: string
+   timeout: number

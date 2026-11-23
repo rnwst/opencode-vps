@@ -27,7 +27,7 @@ from mcp_transport import (
 )
 
 MAX_FRAME = 256 * 1024
-SESSION = re.compile(r"ses_[A-Za-z0-9]+\Z")
+SESSION = re.compile(r"ses_?[A-Za-z0-9]+\Z")
 SAFE_SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\Z")
 QUEUE_SIZE = 16
 

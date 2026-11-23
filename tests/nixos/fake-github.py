@@ -117,6 +117,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        if self.path == "/v1/chat/completions":
+            body = json.loads(
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            )
+            text = "Fixture task completed."
+            usage = {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+            base = {"id": "chatcmpl-fixture", "created": 1, "model": "fixture"}
+            if not body.get("stream"):
+                self.respond(
+                    base
+                    | {
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": text},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": usage,
+                    }
+                )
+                return
+            chunks = [
+                base
+                | {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": text},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                base
+                | {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": usage,
+                },
+            ]
+            data = (
+                "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+                + "data: [DONE]\n\n"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path == "/repos/owner/repo/forks":
             remote = ROOT / "bot-repo.git"
             if not remote.exists():

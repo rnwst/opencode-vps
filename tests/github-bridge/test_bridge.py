@@ -26,6 +26,106 @@ sys.modules[SPEC.name] = bridge
 SPEC.loader.exec_module(bridge)
 
 
+class OpenCodeV2Test(unittest.TestCase):
+    def client(self, responses):
+        calls = []
+
+        class Http:
+            def request(self, method, url, headers, body=None, allow_status=()):
+                calls.append((method, url, body, allow_status))
+                status, payload = responses.pop(0)
+                return status, payload, {}
+
+        return bridge.OpenCodeClient(Http(), "http://localhost:3000", "test"), calls
+
+    def test_find_session_follows_pages_and_checks_location(self):
+        client, calls = self.client(
+            [
+                (
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": "sesWrong",
+                                "title": "Task",
+                                "location": {"directory": "/other"},
+                            }
+                        ],
+                        "cursor": {"next": "page two"},
+                    },
+                ),
+                (
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": "sesRight",
+                                "title": "Task",
+                                "location": {"directory": "/work"},
+                            }
+                        ],
+                        "cursor": {"next": None},
+                    },
+                ),
+            ]
+        )
+        self.assertEqual(client.find_session("/work", "Task"), "sesRight")
+        self.assertIn("cursor=page+two", calls[1][1])
+
+    def test_message_admission_is_found_before_projection(self):
+        client, calls = self.client([(200, {"data": [{"id": "msg_pending"}]})])
+        self.assertTrue(client.message_exists("sesRoot", "/work", "msg_pending"))
+        self.assertEqual(len(calls), 1)
+
+    def test_message_delivered_between_inbox_and_history_reads(self):
+        client, calls = self.client(
+            [(200, {"data": []}), (200, {"data": {"id": "msg_done"}})]
+        )
+        self.assertTrue(client.message_exists("sesRoot", "/work", "msg_done"))
+        self.assertTrue(calls[1][1].endswith("/api/session/sesRoot/message/msg_done"))
+        client, _ = self.client([(200, {"data": []}), (404, {})])
+        self.assertFalse(client.message_exists("sesRoot", "/work", "msg_absent"))
+
+    def test_invalid_status_response_never_means_idle(self):
+        client, _ = self.client([(200, {})])
+        with self.assertRaises(bridge.BridgeError):
+            client.statuses("/work")
+
+    def test_cancel_removes_pending_inputs_before_later_continuation(self):
+        client, calls = self.client(
+            [
+                (200, {"data": {"interrupted": True}}),
+                (200, {"data": [{"id": "msg_pending"}]}),
+                (204, None),
+            ]
+        )
+        client.abort("sesRoot", "/work")
+        self.assertEqual(calls[0][2], {"resume": False})
+        self.assertEqual(calls[-1][0], "DELETE")
+        self.assertTrue(calls[-1][1].endswith("/inbox/msg_pending"))
+
+    def test_prompt_uses_durable_id_and_separate_session_settings(self):
+        client, calls = self.client([(200, {})] * 4)
+        client.prompt(
+            "sesRoot",
+            "/work",
+            "msg_retry",
+            "build",
+            "openai",
+            "gpt-6-astra",
+            "trusted instructions",
+            "task text",
+        )
+        self.assertEqual([call[0] for call in calls], ["POST", "POST", "PUT", "POST"])
+        self.assertEqual(
+            calls[1][2], {"model": {"providerID": "openai", "id": "gpt-6-astra"}}
+        )
+        self.assertEqual(calls[2][2], {"value": "trusted instructions"})
+        self.assertEqual(
+            calls[3][2], {"id": "msg_retry", "text": "task text", "delivery": "queue"}
+        )
+
+
 class FakeGitHub:
     def __init__(self) -> None:
         self.pulls: dict[tuple[str, str, int], dict[str, Any]] = {}

@@ -4,29 +4,7 @@
 }:
 let
   fakeGitHub = pkgs.writeText "fake-github.py" (builtins.readFile ./fake-github.py);
-  sessionTempPlugin = pkgs.writeText "session-temp-plugin.js" ''
-    import { rm } from "node:fs/promises"
-
-    export const SessionTemp = async ({ directory }) => {
-      const root = "${testSettings.workspacesRoot}"
-      const relative = directory.slice(root.length + 1)
-      const workspaceTmp = relative.startsWith(".tasks/")
-        ? "${testSettings.workspacesTmpRoot}/.tasks/" + relative.slice(".tasks/".length)
-        : "${testSettings.workspacesTmpRoot}/" + relative
-
-      return {
-        event: async (input) => {
-          if (input.event.type !== "session.deleted") return
-          const sessionID = input.event.properties.info.id
-          if (!/^ses_[A-Za-z0-9]+$/.test(sessionID)) return
-          await rm(`''${workspaceTmp}/''${sessionID}`, { recursive: true, force: true })
-        },
-        "shell.env": async (input, output) => {
-          output.env.OPENCODE_SESSION_ID = input.sessionID
-        },
-      }
-    }
-  '';
+  managedPlugin = pkgs.writeTextDir "index.js" localPackages.opencode-plugin.text;
   testSettings = {
     accounts = {
       bot = {
@@ -48,13 +26,14 @@ let
     opencodePort = 4096;
     workspacesRoot = "/srv/opencode/workspaces";
     workspacesTmpRoot = "/srv/opencode/workspace-tmp";
+    previews.enable = false;
     githubBridge = {
       enable = true;
       dryRun = false;
       agent = "build";
       model = {
-        providerID = "opencode";
-        modelID = "big-pickle";
+        providerID = "fixture";
+        modelID = "fixture";
       };
       maxConcurrentTasks = 2;
       minimumFreePercent = 15;
@@ -139,6 +118,22 @@ pkgs.testers.nixosTest {
             HOME = botHome;
             OPENCODE_CONFIG_CONTENT = builtins.toJSON {
               autoupdate = false;
+              model = "fixture/fixture";
+              agents.title.model = "fixture/fixture";
+              providers.fixture = {
+                name = "Offline VM fixture";
+                env = [ "FIXTURE_API_KEY" ];
+                package = "@opencode/ai/providers/openai-compatible";
+                settings.baseURL = "http://127.0.0.1:4080/v1";
+                models.fixture = {
+                  name = "Fixture";
+                  capabilities.tools = true;
+                  limit = {
+                    context = 128000;
+                    output = 1000;
+                  };
+                };
+              };
               permission = {
                 "*" = "allow";
                 external_directory = {
@@ -148,11 +143,12 @@ pkgs.testers.nixosTest {
                   "/tmp/**" = "allow";
                 };
               };
-              plugin = [ "file://${sessionTempPlugin}" ];
+              plugins = [ "file://${managedPlugin}" ];
               share = "disabled";
               shell = "${testLocalPackages.sandbox-exec}/bin/opencode-sandbox-exec";
             };
-            OPENCODE_DISABLE_DEFAULT_PLUGINS = "true";
+            OPENCODE_LOG_LEVEL = "DEBUG";
+            FIXTURE_API_KEY = "test-model-key";
             OPENCODE_DISABLE_MODELS_FETCH = "true";
             OPENCODE_DISABLE_PROJECT_CONFIG = "1";
             OPENCODE_SERVER_PASSWORD = "test-password";
@@ -163,17 +159,9 @@ pkgs.testers.nixosTest {
           serviceConfig = {
             User = testSettings.accounts.bot.name;
             Group = "agent-workspaces";
-            ExecStart = "${testLocalPackages.opencode}/bin/opencode --print-logs --log-level DEBUG serve --hostname 127.0.0.1 --port 4096";
+            ExecStart = "${testLocalPackages.opencode}/bin/opencode serve --hostname 127.0.0.1 --port 4096";
             Restart = "on-failure";
           };
-          preStart = ''
-            install -d -m 0750 ${botHome}/.config/opencode/node_modules
-            printf '%s\n' '${
-              builtins.toJSON {
-                packages."".dependencies."@opencode-ai/plugin" = testLocalPackages.opencode.version;
-              }
-            }' > ${botHome}/.config/opencode/package-lock.json
-          '';
         };
 
         fake-github = {
@@ -210,7 +198,7 @@ pkgs.testers.nixosTest {
     try:
       # The TCP socket can open before OpenCode registers its HTTP handlers.
       machine.wait_until_succeeds(
-        curl + "http://127.0.0.1:4096/global/health | jq -e .healthy",
+        curl + "http://127.0.0.1:4096/api/info | jq -e .version",
         timeout=120,
       )
     except Exception:
@@ -360,43 +348,57 @@ pkgs.testers.nixosTest {
     created = machine.succeed(
       f"{curl}"
       "--header 'Content-Type: application/json' "
-      "--data '{\"title\":\"Bridge test session\"}' "
-      f"'http://127.0.0.1:4096/session?directory={directory}'"
+      "--data '{\"title\":\"Bridge test session\",\"location\":{\"directory\":\"/srv/opencode/workspaces/alpha\"}}' "
+      "'http://127.0.0.1:4096/api/session'"
     )
-    session_id = json.loads(created)["id"]
+    session_id = json.loads(created)["data"]["id"]
     machine.succeed(
       f"{curl}"
       "--header 'Content-Type: application/json' "
-      "--data '{\"noReply\":true,\"parts\":[{\"type\":\"text\","
-      "\"text\":\"deterministic bridge prompt\"}]}' "
-      f"'http://127.0.0.1:4096/session/{session_id}/prompt_async?directory={directory}'"
+      "--data '{\"resume\":false,\"text\":\"deterministic bridge prompt\"}' "
+      f"'http://127.0.0.1:4096/api/session/{session_id}/prompt'"
     )
     machine.wait_until_succeeds(
       f"{curl}"
-      f"'http://127.0.0.1:4096/session/{session_id}/message?directory={directory}' "
-      "| jq -e 'map(.parts[]? | select(.type == \"text\") | .text) "
+      f"'http://127.0.0.1:4096/api/session/{session_id}/inbox' "
+      "| jq -e '.data | map(.payload.text) "
       "| index(\"deterministic bridge prompt\")'"
     )
-    manual_shell = machine.succeed(
+    machine.succeed(
       f"{curl}"
       "--header 'Content-Type: application/json' "
-      "--data '{\"agent\":\"build\",\"model\":{\"providerID\":\"opencode\","
-      "\"modelID\":\"big-pickle\"},\"command\":"
+      "--data '{\"command\":"
       "\"touch /tmp/manual-session; printf %s \\\"$OPENCODE_SESSION_ID\\\"\"}' "
-      f"'http://127.0.0.1:4096/session/{session_id}/shell?directory={directory}'"
+      f"'http://127.0.0.1:4096/api/session/{session_id}/shell'"
     )
-    manual_response = json.loads(manual_shell)
-    assert manual_response["parts"][0]["state"]["output"] == session_id, manual_response
-    machine.succeed(
+    machine.wait_until_succeeds(
       f"test -f /srv/opencode/workspace-tmp/alpha/{session_id}/manual-session"
     )
+    child = json.loads(machine.succeed(
+      f"{curl}--header 'Content-Type: application/json' "
+      f"--data '{{\"parentID\":\"{session_id}\",\"title\":\"Child routing test\"}}' "
+      "'http://127.0.0.1:4096/api/session'"
+    ))["data"]["id"]
     machine.succeed(
-      f"{curl}--request POST "
-      f"'http://127.0.0.1:4096/session/{session_id}/abort?directory={directory}'"
+      f"{curl}--header 'Content-Type: application/json' "
+      "--data '{\"command\":\"touch /tmp/from-child\"}' "
+      f"'http://127.0.0.1:4096/api/session/{child}/shell'"
+    )
+    machine.wait_until_succeeds(
+      f"test -f /srv/opencode/workspace-tmp/alpha/{session_id}/from-child"
+    )
+    machine.fail(f"test -d /srv/opencode/workspace-tmp/alpha/{child}")
+    machine.succeed(
+      f"{curl}--request DELETE 'http://127.0.0.1:4096/api/session/{child}'"
+    )
+    machine.succeed(f"test -f /srv/opencode/workspace-tmp/alpha/{session_id}/from-child")
+    machine.succeed(
+      f"{curl}--header 'Content-Type: application/json' --data '{{\"resume\":false}}' "
+      f"'http://127.0.0.1:4096/api/session/{session_id}/interrupt'"
     )
     machine.succeed(
       f"{curl}--request DELETE "
-      f"'http://127.0.0.1:4096/session/{session_id}?directory={directory}'"
+      f"'http://127.0.0.1:4096/api/session/{session_id}'"
     )
     machine.wait_until_succeeds(
       f"test ! -e /srv/opencode/workspace-tmp/alpha/{session_id}"
@@ -423,36 +425,43 @@ pkgs.testers.nixosTest {
     )
     machine.wait_until_succeeds(
       f"{curl}"
-      f"'http://127.0.0.1:4096/session?directory={task_directory}' "
-      "| jq -e '.[0].title | contains(\"owner/repo#1 implement\")'"
+      f"'http://127.0.0.1:4096/api/session?directory={task_directory}' "
+      "| jq -e '.data[0].title | contains(\"owner/repo#1 implement\")'"
     )
     machine.wait_until_succeeds(
       f"{curl}"
-      f"'http://127.0.0.1:4096/session?directory={task_directory}' "
-      "| jq -er '.[0].id' > /tmp/task-session-id"
+      f"'http://127.0.0.1:4096/api/session?directory={task_directory}' "
+      "| jq -er '.data[0].id' > /tmp/task-session-id"
     )
     machine.wait_until_succeeds(
       "session=$(cat /tmp/task-session-id); "
       f"{curl}"
-      f"\"http://127.0.0.1:4096/session/$session/message?directory={task_directory}\" "
-      "| jq -e 'map(.parts[]? | select(.type == \"text\") | .text) "
+      f"\"http://127.0.0.1:4096/api/session/$session/message\" "
+      "| jq -e '.data | map(select(.type == \"user\") | .text) "
       "| any(startswith(\"## GitHub Task\\n\\n- Action:\"))'"
     )
     machine.wait_until_succeeds(
       "session=$(cat /tmp/task-session-id); "
       f"{curl}"
-      f"'http://127.0.0.1:4096/session/status?directory={task_directory}' "
-      "| jq -e --arg session \"$session\" '(.[$session].type // \"idle\") == \"idle\"'"
+      "'http://127.0.0.1:4096/api/session/active' "
+      "| jq -e --arg session \"$session\" '.data[$session] == null'",
+      timeout=60,
+    )
+    machine.succeed(
+      "session=$(cat /tmp/task-session-id); "
+      f"{curl}"
+      "\"http://127.0.0.1:4096/api/session/$session/message\" "
+      "| jq -e '.data | any(.type == \"assistant\" and .finish == \"stop\" "
+      "and any(.content[]?; .type == \"text\" and .text == \"Fixture task completed.\"))'"
     )
     machine.succeed(
       "session=$(cat /tmp/task-session-id); "
       f"{curl}"
       "--header 'Content-Type: application/json' "
-      "--data '{\"agent\":\"build\",\"model\":{\"providerID\":\"opencode\","
-      "\"modelID\":\"big-pickle\"},\"command\":\"touch /tmp/from-opencode\"}' "
-      f"\"http://127.0.0.1:4096/session/$session/shell?directory={task_directory}\""
+      "--data '{\"command\":\"touch /tmp/from-opencode\"}' "
+      "\"http://127.0.0.1:4096/api/session/$session/shell\""
     )
-    machine.succeed(
+    machine.wait_until_succeeds(
       f"session=$(cat /tmp/task-session-id); test -f "
       f"/srv/opencode/workspace-tmp/.tasks/{task_id}/$session/from-opencode"
     )

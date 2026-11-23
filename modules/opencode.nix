@@ -61,13 +61,7 @@ let
           "/tmp/**" = "allow";
         };
       };
-      plugin = [ "file:///etc/opencode/plugins/managed-host.js" ];
-      server = {
-        cors = [ "https://${settings.publicHostName}" ];
-        hostname = "127.0.0.1";
-        mdns = false;
-        port = settings.opencodePort;
-      };
+      plugins = [ "file:///etc/opencode/plugins/managed-host" ];
       share = "disabled";
       shell =
         if previewCfg.enable then
@@ -90,7 +84,7 @@ in
     etc = {
       "opencode/AGENTS.md".source = agentsFile;
       "opencode/opencode.json".source = managedConfig;
-      "opencode/plugins/managed-host.js".source = localPackages.opencode-plugin;
+      "opencode/plugins/managed-host/index.js".source = localPackages.opencode-plugin;
     };
     systemPackages = [
       localPackages.opencode-git

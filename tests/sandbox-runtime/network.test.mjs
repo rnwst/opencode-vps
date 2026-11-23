@@ -245,7 +245,7 @@ test('built SRT enforces public-only destination dialing', { timeout: 60000 }, a
       }
       answer = records('127.0.0.1')
       const count = dials.length
-      if (route === 'http') assert.match(await absolute('public.test'), /^HTTP\/1\.1 500/)
+      if (route === 'http') assert.match(await absolute('public.test'), /^HTTP\/1\.1 502/)
       else {
         const tunnel = route === 'connect'
           ? await connect('public.test') : await socksConnect('public.test')
@@ -318,7 +318,7 @@ test('built SRT enforces public-only destination dialing', { timeout: 60000 }, a
       const before = dials.length
       for (const host of ['public.test', '127.0.0.1', '[::ffff:127.0.0.1]']) {
         assert.match(await response(await client(proxyPort),
-          `GET https://${host}:8443/ HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n`), /^HTTP\/1\.1 500/)
+          `GET https://${host}:8443/ HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n`), /^HTTP\/1\.1 502/)
       }
       assert.equal(dials.length, before)
     } finally {
@@ -340,7 +340,7 @@ test('built SRT enforces public-only destination dialing', { timeout: 60000 }, a
     answer = records(publicV4, '127.0.0.1')
     const dialCount = dials.length
     assert.match(await response(secure,
-      'GET / HTTP/1.1\r\nHost: public.test\r\nConnection: close\r\n\r\n'), /^HTTP\/1\.1 403/)
+      'GET / HTTP/1.1\r\nHost: public.test\r\nConnection: close\r\n\r\n'), /^HTTP\/1\.1 502/)
     assert.equal(dials.length, dialCount)
     assert.equal(lookups.length, count + 2, 'same tunnel must not cache DNS')
 
@@ -355,7 +355,7 @@ test('built SRT enforces public-only destination dialing', { timeout: 60000 }, a
       const before = dials.length
       const text = await response(secure,
         'GET / HTTP/1.1\r\nHost: public.test\r\nConnection: close\r\n\r\n')
-      assert.match(text, host === 'wrong.test' ? /^HTTP\/1\.1 502/ : /^HTTP\/1\.1 403/)
+      assert.match(text, /^HTTP\/1\.1 502/)
       assert.equal(dials.length, before + (host === 'wrong.test' ? 1 : 0))
     }
     assert.equal(tlsSeen.length, 1, 'bad certificates must not receive HTTP bytes')

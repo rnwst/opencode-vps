@@ -104,6 +104,8 @@ pkgs.testers.nixosTest {
       environment = {
         HOME = botHome;
         NODE_EXTRA_CA_CERTS = "/run/sandbox-fixture/ca.crt";
+        OPENCODE_PASSWORD = "test-v2-server-password";
+        OPENCODE_SERVER_PASSWORD = "test-v1-server-password";
       };
       # Keep the sandbox-relevant hardening in modules/opencode.nix, without
       # installing OpenCode or giving the test a less restricted service.
@@ -179,7 +181,10 @@ pkgs.testers.nixosTest {
     for host in ["93.184.216.34", "127.0.0.1", "10.55.0.1", "169.254.169.254"]:
         machine.succeed(f"curl --noproxy '*' --fail http://{host}:8081/health")
     machine.succeed("systemctl start --no-block sandbox-probe.service")
-    machine.wait_until_succeeds("test -e ${workspace}/ready")
+    machine.wait_until_succeeds(
+      "test -e ${workspace}/ready || systemctl is-failed --quiet sandbox-probe.service"
+    )
+    machine.succeed("test -e ${workspace}/ready")
     isolated = "cd ${workspace} && OPENCODE_SESSION_ID=ses_two ${wrapper} -c '${python} other-session'"
     machine.succeed("runuser -u ${settings.accounts.bot.name} -- sh -c " + shlex.quote(isolated))
     machine.succeed("${python} disclose ${workspace} ${temporary}")

@@ -5,8 +5,15 @@
 }:
 let
   inherit (pkgs) julia;
+  # 0.12 requires read permission on bind-mount parents. 0.13 restores O_PATH
+  # traversal, needed for the host's intentionally non-listable temp roots.
+  inherit (pkgsUnstable) bubblewrap;
   botHome = "/home/${settings.accounts.bot.name}";
-  opencode = import ./opencode.nix { inherit pkgsUnstable; };
+  # Follow nixpkgs' version and recipe. Expose trusted session metadata to the
+  # shell hook for both agent tools and the session-shell API.
+  opencode = pkgsUnstable.opencode.overrideAttrs (oldAttrs: {
+    patches = (oldAttrs.patches or [ ]) ++ [ ./opencode-shell-session.patch ];
+  });
   playwright-mcp = import ./playwright-mcp.nix { inherit pkgs; };
   searchfox-cli = import ./searchfox-cli.nix { inherit pkgs; };
   previewCfg = import ../config/previews.nix {
@@ -45,10 +52,15 @@ let
         if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64"
       } --allow-unix-sockets
       xxd -i -n unix_allow_bpf unix-allow.bpf > "$helper_dir/unix-allow-bpf.h"
+      ./generate-seccomp namespace-block.bpf ${
+        if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64"
+      } namespaces
+      xxd -i -n namespace_block_bpf namespace-block.bpf > "$helper_dir/namespace-block-bpf.h"
       $CC -O2 -Wall -Wextra -I "$helper_dir" vendor/seccomp-src/apply-seccomp.c \
         -o "$helper_dir/apply-seccomp"
       rm generate-seccomp unix-block.bpf "$helper_dir/unix-block-bpf.h"
       rm unix-allow.bpf "$helper_dir/unix-allow-bpf.h"
+      rm namespace-block.bpf "$helper_dir/namespace-block-bpf.h"
     '';
     postInstall = (oldAttrs.postInstall or "") + ''
       test -x "$out/lib/node_modules/@anthropic-ai/sandbox-runtime/$helper_dir/apply-seccomp"
@@ -56,7 +68,7 @@ let
   });
 
   sandbox-isolate = import ./sandbox-isolate.nix {
-    inherit pkgs;
+    inherit pkgs bubblewrap;
     sandboxRuntime = sandbox-runtime;
   };
 
@@ -216,8 +228,8 @@ let
           workspace_tmp="${settings.workspacesTmpRoot}/$relative"
           ;;
       esac
-      session_id="''${OPENCODE_SESSION_ID:-ses_cli}"
-      [[ "$session_id" =~ ^ses_[A-Za-z0-9]+$ ]] || { echo "invalid OpenCode session ID" >&2; exit 77; }
+      session_id="''${OPENCODE_MANAGED_SESSION_ID:-''${OPENCODE_SESSION_ID:-ses_cli}}"
+      [[ "$session_id" =~ ^ses_?[A-Za-z0-9]+$ ]] || { echo "invalid OpenCode session ID" >&2; exit 77; }
       [[ -d "$workspace_tmp" && ! -L "$workspace_tmp" ]] || {
         echo "temporary root is unavailable for workspace: $root" >&2
         exit 77
@@ -277,7 +289,7 @@ let
         export GIT_TERMINAL_PROMPT=0
       fi
 
-      unset OPENCODE_SERVER_PASSWORD
+      unset OPENCODE_PASSWORD OPENCODE_SERVER_PASSWORD
       export OPENCODE_SANDBOX_WORKSPACE="$root"
       export BUN_INSTALL_CACHE_DIR=/tmp/opencode-cache/bun
       export CARGO_HOME=/tmp/opencode-cache/cargo
@@ -305,7 +317,7 @@ let
         --arg opencode_auth "$HOME/.local/share/opencode/auth.json" \
         --arg ssh_dir "$HOME/.ssh" \
         --arg credentials_dir "''${CREDENTIALS_DIRECTORY:-/run/credentials}" \
-        --arg bwrap "${pkgs.bubblewrap}/bin/bwrap" \
+        --arg bwrap "${bubblewrap}/bin/bwrap" \
         --arg rg "${pkgs.ripgrep}/bin/rg" \
         --arg socat "${pkgs.socat}/bin/socat" \
         --arg seccomp "$seccomp" \
@@ -408,7 +420,7 @@ let
           git: { safeDirectories: [$root] }
         }' > "$settings_file"
 
-      ${pkgs.bubblewrap}/bin/bwrap \
+      ${bubblewrap}/bin/bwrap \
         --die-with-parent \
         --new-session \
         --ro-bind / / \
@@ -491,7 +503,7 @@ let
       export XDG_DATA_HOME="$home_dir/.local/share"
       export XDG_RUNTIME_DIR="/run/user/$uid"
       export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
-      unset GH_TOKEN GITHUB_TOKEN OPENCODE_SERVER_PASSWORD CREDENTIALS_DIRECTORY
+      unset GH_TOKEN GITHUB_TOKEN OPENCODE_PASSWORD OPENCODE_SERVER_PASSWORD CREDENTIALS_DIRECTORY
 
       if [[ ! -S "$XDG_RUNTIME_DIR/docker.sock" ]]; then
         echo "rootless Docker is not ready at $XDG_RUNTIME_DIR/docker.sock" >&2
@@ -520,11 +532,11 @@ let
     ];
     text = ''
       : "''${CREDENTIALS_DIRECTORY:?systemd credentials are not available}"
-      export OPENCODE_SERVER_USERNAME=opencode
-      OPENCODE_SERVER_PASSWORD="$(<"$CREDENTIALS_DIRECTORY/server-password")"
-      export OPENCODE_SERVER_PASSWORD
-      exec ${opencode}/bin/opencode web \
+      OPENCODE_PASSWORD="$(<"$CREDENTIALS_DIRECTORY/server-password")"
+      export OPENCODE_PASSWORD
+      exec ${opencode}/bin/opencode serve \
         --hostname 127.0.0.1 \
+        --cors ${pkgs.lib.escapeShellArg "https://${settings.publicHostName}"} \
         --port ${toString settings.opencodePort}
     '';
   };
@@ -534,11 +546,9 @@ let
     import { realpathSync } from "node:fs"
     import { readFile, rename, rm, unlink, writeFile } from "node:fs/promises"
 
-    const { tool } = await import(
-      Bun.resolveSync("@opencode-ai/plugin", ${builtins.toJSON "${botHome}/.config/opencode"}),
-    )
-
-    export const ManagedHost = async ({ directory, client }) => {
+    // A plain definition avoids runtime installation of an SDK dependency.
+    export default { id: "managed-host", async setup(ctx) {
+      const directory = ctx.location.directory
       let workspaceAllowed = false
       let workspaceTmp
       try {
@@ -561,16 +571,12 @@ let
       const rootSessionID = async (sessionID) => {
         const seen = new Set()
         while (seen.size < 64) {
-          if (typeof sessionID !== "string" || !/^ses_[A-Za-z0-9]+$/.test(sessionID) || seen.has(sessionID)) {
+          if (typeof sessionID !== "string" || !/^ses_?[A-Za-z0-9]+$/.test(sessionID) || seen.has(sessionID)) {
             throw new Error("Invalid OpenCode session ancestry")
           }
           seen.add(sessionID)
-          const { data } = await client.session.get({
-            path: { id: sessionID },
-            query: { directory },
-            throwOnError: true,
-          })
-          if (!data || data.id !== sessionID || data.directory !== directory) {
+          const data = await ctx.session.get({ sessionID })
+          if (!data || data.id !== sessionID || data.location?.directory !== directory) {
             throw new Error("OpenCode session does not match the managed workspace")
           }
           if (data.parentID === undefined) return sessionID
@@ -580,11 +586,11 @@ let
       }
 
       const tmpPathKeys = {
-        edit: "filePath",
+        edit: "path",
+        write: "path",
         glob: "path",
         grep: "path",
-        read: "filePath",
-        write: "filePath",
+        read: "path",
       }
       const isTmpPath = (value) =>
         typeof value === "string" && (value === "/tmp" || value.startsWith("/tmp/"))
@@ -592,7 +598,7 @@ let
       // Privileged workspace changes cross a file-based request channel so the
       // OpenCode process never receives sudo access or an unmasked GitHub token.
       const managedRequest = async (operation, args, context) => {
-        if (!workspaceAllowed || context.directory !== directory) {
+        if (!workspaceAllowed) {
           throw new Error("Managed GitHub operations require the current workspace")
         }
         const sessionID = await rootSessionID(context.sessionID)
@@ -607,13 +613,13 @@ let
           operation,
           request_id: requestID,
           session_id: sessionID,
-          directory: context.directory,
+          directory,
           expires_at: Date.now() + timeout,
           arguments: args,
         })
-        let aborted = context.abort.aborted
+        let aborted = context.signal.aborted
         const abort = () => { aborted = true }
-        context.abort.addEventListener("abort", abort, { once: true })
+        context.signal.addEventListener("abort", abort, { once: true })
         await writeFile(temporary, payload, { flag: "wx", mode: 0o640 })
         await rename(temporary, request)
 
@@ -635,18 +641,22 @@ let
           }
           throw new Error("Timed out waiting for managed GitHub operation")
         } finally {
-          context.abort.removeEventListener("abort", abort)
+          context.signal.removeEventListener("abort", abort)
           await unlink(temporary).catch(() => {})
           await unlink(request).catch(() => {})
         }
       }
 
-      return {
-        event: async (input) => {
-          if (input.event.type !== "session.deleted" || !workspaceTmp) return
+      const controller = new AbortController()
+      const events = (async () => {
+        for await (const event of ctx.event.subscribe({ types: ["session.deleted"], signal: controller.signal })) {
+          // V2 routes deletion events by session, but the envelope can omit
+          // location. Cleanup still targets only this instance's workspace.
+          if (!workspaceTmp || (event.location && event.location.directory !== directory)) continue
           // Deleting a child must not stop its root conversation's runtime.
-          const sessionID = input.event.properties.info.id
-          if (!/^ses_[A-Za-z0-9]+$/.test(sessionID)) return
+          const sessionID = event.data.sessionID
+          if (!/^ses_?[A-Za-z0-9]+$/.test(sessionID)) continue
+          try {
           ${pkgs.lib.optionalString previewCfg.enable ''
             const stopped = Bun.spawn([
               "${opencode-preview}/bin/opencode-session-exec", "stop",
@@ -657,48 +667,71 @@ let
             }
           ''}
           await rm(`''${workspaceTmp}/''${sessionID}`, { recursive: true, force: true })
-        },
-        "shell.env": async (input, output) => {
+          } catch (error) {
+            console.error("Managed session cleanup failed", error)
+          }
+        }
+      })()
+      events.catch(error => { if (!controller.signal.aborted) console.error("Managed session cleanup failed", error) })
+      await ctx.shell.hook("create.before", async (event) => {
           if (!workspaceAllowed) throw new Error("Shells require a managed workspace")
-          if (input.sessionID === undefined) return
-          output.env.OPENCODE_SESSION_ID = await rootSessionID(input.sessionID)
-        },
-        "tool.execute.before": async (input, output) => {
+          event.shell = "${
+            if previewCfg.enable then
+              "${opencode-preview}/bin/opencode-session-exec"
+            else
+              "${sandbox-exec}/bin/opencode-sandbox-exec"
+          }"
+          // Core assigns OPENCODE_SESSION_ID after this hook. Keep our trusted
+          // root routing separately; never trust a session's environment value.
+          delete event.env.OPENCODE_MANAGED_SESSION_ID
+          const sessionID = event.sessionID
+          delete event.env.OPENCODE_SESSION_ID
+          if (sessionID !== undefined) {
+            const root = await rootSessionID(sessionID)
+            event.env.OPENCODE_MANAGED_SESSION_ID = root
+            event.env.OPENCODE_SESSION_ID = root
+          }
+      })
+      await ctx.tool.hook("execute.before", async (event) => {
           if (!workspaceAllowed) {
             throw new Error("Tools are restricted to ${settings.workspacesRoot}")
           }
-          ${pkgs.lib.optionalString previewCfg.enable ''
-            if (input.tool.startsWith("playwright_")) {
-              // MCP connections are project-scoped; route each call using the
-              // trusted root conversation, never a model-selected session ID.
-              output.args.__opencode_session_id = await rootSessionID(input.sessionID)
-            }
-          ''}
-          const key = tmpPathKeys[input.tool]
-          if (key && isTmpPath(output.args?.[key])) {
+          const key = tmpPathKeys[event.tool]
+          if (key && isTmpPath(event.input?.[key])) {
             throw new Error("Direct file tools cannot access shell temporary files; use bash")
           }
-        },
-        tool: {
+          if (event.tool === "patch") {
+            for (const line of String(event.input?.patchText ?? "").split("\n")) {
+              const match = line.match(/^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$/)
+              if (match && isTmpPath(match[1])) throw new Error("Direct file tools cannot access shell temporary files; use shell")
+            }
+          }
+      })
+      await ctx.tool.transform(editor => {
           ${pkgs.lib.optionalString settings.githubBridge.enable ''
-            github_track_pr: tool({
+            editor.add({
+              name: "github_track_pr",
               description: "Associate a bot-authored GitHub pull request with the current OpenCode session so future controller feedback resumes this conversation.",
-              args: {
-                pr_url: tool.schema.string().url().describe("GitHub pull request URL returned by gh pr create"),
+              input: {
+                type: "object", properties: { pr_url: { type: "string", format: "uri" } }, required: ["pr_url"], additionalProperties: false,
               },
               async execute(args, context) {
                 await managedRequest("track_pr", { pr_url: args.pr_url }, context)
-                return `Registered ${"$"}{args.pr_url} with this conversation`
+                return { content: `Registered ${"$"}{args.pr_url} with this conversation` }
               },
-            }),
-            github_manage_remote: tool({
+            })
+            editor.add({
+              name: "github_manage_remote",
               description: "Safely configure, fetch, or track validated GitHub remotes without exposing arbitrary .git/config writes. Use setup to discover or create a writable bot fork and configure origin/source/upstream.",
-              args: {
-                action: tool.schema.enum(["setup", "set", "fetch", "track"]),
-                repository: tool.schema.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/).optional(),
-                upstream_repository: tool.schema.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/).optional(),
-                remote: tool.schema.enum(["origin", "source", "upstream", "all"]).optional(),
-                branch: tool.schema.string().max(255).optional(),
+              input: {
+                type: "object", required: ["action"], additionalProperties: false,
+                properties: {
+                  action: { type: "string", enum: ["setup", "set", "fetch", "track"] },
+                  repository: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$" },
+                  upstream_repository: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$" },
+                  remote: { type: "string", enum: ["origin", "source", "upstream", "all"] },
+                  branch: { type: "string", maxLength: 255 },
+                },
               },
               async execute(args, context) {
                 if (["setup", "set"].includes(args.action) && !args.repository) {
@@ -708,22 +741,27 @@ let
                   throw new Error("upstream_repository is valid only for setup")
                 }
                 const result = await managedRequest("manage_github_remote", args, context)
-                return JSON.stringify(result, null, 2)
+                return { content: JSON.stringify(result, null, 2) }
               },
-            }),
+            })
           ''}
-          ci_run: tool({
+          editor.add({
+            name: "ci_run",
             description: "Run a GitHub Actions workflow locally with act in the isolated CI account.",
-            args: {
-              workflow: tool.schema.string().optional().describe("Relative workflow file path"),
-              job: tool.schema.string().optional().describe("Workflow job name"),
-              event: tool.schema.string().optional().describe("GitHub event name; defaults to push"),
-              timeout: tool.schema.string().optional().describe("Maximum duration; defaults to 45m"),
+            input: {
+              type: "object", additionalProperties: false,
+              properties: {
+                workflow: { type: "string", description: "Relative workflow file path" },
+                job: { type: "string", description: "Workflow job name" },
+                event: { type: "string", description: "GitHub event name; defaults to push" },
+                timeout: { type: "string", description: "Maximum duration; defaults to 45m" },
+              },
             },
             async execute(args, context) {
+              await rootSessionID(context.sessionID)
               const command = [
                 "/run/wrappers/bin/sudo", "-n", "-u", "ci-runner", "--",
-                "${agent-ci}/bin/agent-ci", "--source", context.directory,
+                "${agent-ci}/bin/agent-ci", "--source", directory,
               ]
               if (args.workflow) command.push("--workflow", args.workflow)
               if (args.job) command.push("--job", args.job)
@@ -739,7 +777,7 @@ let
                   output = output.slice(-100000)
                   truncated = true
                 }
-                context.metadata({
+                void context.progress({
                   title: "ci_run",
                   metadata: { output: output.slice(-30000) },
                 })
@@ -755,23 +793,24 @@ let
                 publish(decoder.decode())
               }
               const abort = () => child.kill()
-              context.abort.addEventListener("abort", abort, { once: true })
+              context.signal.addEventListener("abort", abort, { once: true })
               const [, , status] = await Promise.all([
                 pump(child.stdout),
                 pump(child.stderr),
                 child.exited,
-              ]).finally(() => context.abort.removeEventListener("abort", abort))
+              ]).finally(() => context.signal.removeEventListener("abort", abort))
               const prefix = truncated ? "[earlier CI output truncated]\n" : ""
-              return `${"$"}{prefix}${"$"}{output}\n\nci_run exited with status ${"$"}{status}`
+              return { content: `${"$"}{prefix}${"$"}{output}\n\nci_run exited with status ${"$"}{status}` }
             },
-          }),
-        },
-      }
-    }
+          })
+      })
+      return () => controller.abort()
+    } }
   '';
 in
 {
   inherit
+    bubblewrap
     agent-ci
     fish
     github-bridge

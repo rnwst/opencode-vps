@@ -1,68 +1,58 @@
 diff --git a/src/sandbox/parent-proxy.ts b/src/sandbox/parent-proxy.ts
 --- a/src/sandbox/parent-proxy.ts
 +++ b/src/sandbox/parent-proxy.ts
-@@ -22,6 +22,7 @@
- import { URL } from 'node:url'
- import { logForDebugging } from '../utils/debug.js'
+@@ -29,4 +29,5 @@
  import type { ParentProxyConfig } from './sandbox-config.js'
-+import { lookup } from 'node:dns/promises'
++import { lookup as publicLookup } from 'node:dns/promises'
+ import {
+   addRange,
+   addressInSet,
+@@ -32,6 +33,5 @@
+   addressInSet,
+   isLoopbackAddress,
+-  mappedIPv4,
+ } from './address.js'
  
  export interface ResolvedParentProxy {
-   httpUrl?: URL
-@@ -64,6 +65,19 @@
+@@ -75,6 +75,14 @@
  export function resolveParentProxy(
    cfg?: ParentProxyConfig,
  ): ResolvedParentProxy | undefined {
-+  // An upstream proxy can resolve a different address than the one we checked.
-+  // This host build supports only locally resolved, public destination dials.
++  // Parent proxies resolve elsewhere, outside this host's address policy.
 +  if (
-+    cfg?.http ||
-+    cfg?.https ||
-+    process.env.HTTP_PROXY ||
-+    process.env.http_proxy ||
-+    process.env.HTTPS_PROXY ||
-+    process.env.https_proxy
++    cfg?.http || cfg?.https ||
++    process.env.HTTP_PROXY || process.env.http_proxy ||
++    process.env.HTTPS_PROXY || process.env.https_proxy
 +  ) {
 +    throw new Error('Parent proxies are unsupported by public-only egress')
 +  }
-+
    const http =
      cfg?.http ?? process.env.HTTP_PROXY ?? process.env.http_proxy ?? undefined
    const https =
-@@ -482,18 +496,74 @@
+@@ -535,6 +543,5 @@
+-    // An IPv4-mapped literal connects to that IPv4 address, so it is spelled
+-    // as one: allow/deny entries and requests then compare equal.
+-    return isIP(out) === 6 ? (mappedIPv4(out) ?? out) : out.replace(/\.$/, '')
++    // Preserve transition literals so the public-only policy rejects them.
++    return out.replace(/\.$/, '')
+   } catch {
+     return undefined
    }
- }
- 
-+// Conservatively exclude special-use space, including globally reachable
-+// exceptions within these ranges. IPv6 is limited to native global unicast:
-+// mapped/compatible IPv4, NAT64, Teredo and 6to4 must not tunnel around IPv4
-+// checks. Network-specific NAT64 prefixes must also be disabled on the host.
+@@ -543,1 +550,43 @@
 +const nonPublicV4 = new BlockList()
 +for (const [address, prefix] of [
-+  ['0.0.0.0', 8],
-+  ['10.0.0.0', 8],
-+  ['100.64.0.0', 10],
-+  ['127.0.0.0', 8],
-+  ['169.254.0.0', 16],
-+  ['172.16.0.0', 12],
-+  ['192.0.0.0', 24],
-+  ['192.0.2.0', 24],
-+  ['192.88.99.0', 24],
-+  ['192.168.0.0', 16],
-+  ['198.18.0.0', 15],
-+  ['198.51.100.0', 24],
-+  ['203.0.113.0', 24],
-+  ['224.0.0.0', 3],
++  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10],
++  ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
++  ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24],
++  ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
++  ['203.0.113.0', 24], ['224.0.0.0', 3],
 +] as const) nonPublicV4.addSubnet(address, prefix, 'ipv4')
 +const globalV6 = new BlockList()
 +globalV6.addSubnet('2000::', 3, 'ipv6')
 +const nonPublicV6 = new BlockList()
 +for (const [address, prefix] of [
-+  ['2001::', 23], // Special protocols, including Teredo and ORCHID.
-+  ['2001:db8::', 32],
-+  ['2002::', 16], // 6to4 embeds an IPv4 destination.
-+  ['3ffe::', 16], // Former 6bone allocation.
-+  ['3fff::', 20], // Documentation.
++  ['2001::', 23], ['2001:db8::', 32], ['2002::', 16],
++  ['3ffe::', 16], ['3fff::', 20],
 +] as const) nonPublicV6.addSubnet(address, prefix, 'ipv6')
 +
 +export function isPublicAddress(address: string): boolean {
@@ -73,63 +63,65 @@ diff --git a/src/sandbox/parent-proxy.ts b/src/sandbox/parent-proxy.ts
 +    !nonPublicV6.check(address, 'ipv6')
 +}
 +
-+/** Resolve anew for each connection; reject the entire mixed answer set. */
++/** Reject the entire mixed answer set, and dial only the checked literal. */
 +export async function resolvePublicAddress(host: string): Promise<string> {
 +  if (!isValidHost(host)) throw new Error('Invalid public-egress host')
++  const bare = stripBrackets(host)
++  if (isIP(bare) && !isPublicAddress(bare)) {
++    throw new Error('Destination is not public unicast')
++  }
 +  const canonical = canonicalizeHost(host)
 +  if (!canonical) throw new Error('Invalid public-egress host')
-+  // Node skips lookup callbacks for literals, so check them explicitly too.
 +  const addresses = isIP(canonical)
 +    ? [{ address: canonical }]
-+    : await lookup(canonical, { all: true, verbatim: true })
++    : await publicLookup(canonical, { all: true, verbatim: true })
 +  if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
 +    throw new Error('Destination is not public unicast')
 +  }
 +  return addresses[0]!.address
 +}
 +
- /**
-  * Dial `host:port` directly with a bounded timeout. Shared by the HTTP and
-  * SOCKS direct-connect paths so they get the same timeout behaviour as the
-  * CONNECT-tunnelled paths.
-  */
+ /** Per-dial name resolution the proxies are handed: the guard's `lookup` for `port`, refusals recorded. */
+@@ -585,10 +649,6 @@
+-  lookup: LookupFunction | undefined,
++  _lookup: LookupFunction | undefined,
+   tls: boolean,
+ ): Promise<DirectRequestOptions> {
+-  let address = host
+-  if (lookup && !isIP(host)) {
+-    const probe = await dialDirect(host, port, lookup)
+-    address = probe.remoteAddress ?? ''
+-    probe.destroy()
+-    if (!address) throw new Error(`connect ${host}:${port}: no peer address`)
+-  }
++  // This host's mandatory public-only policy also applies to IP literals
++  // and callers without an optional upstream resolved-address guard.
++  const address = await resolvePublicAddress(host)
+@@ -613,8 +673,9 @@
 -export function dialDirect(
 +export async function dialDirect(
    host: string,
    port: number,
+-  lookup: LookupFunction | undefined,
++  _lookup: LookupFunction | undefined,
    timeoutMs = CONNECT_TIMEOUT_MS,
  ): Promise<Socket> {
 +  const address = await resolvePublicAddress(host)
    return new Promise((resolve, reject) => {
--    const s = netConnect(port, host)
-+    const s = netConnect(port, address)
-     let settled = false
-     const done = (err?: Error) => {
-       if (settled) return
+-    const s = netConnect({ port, host, lookup })
++    const s = netConnect({ port, host: address })
 diff --git a/src/sandbox/http-proxy.ts b/src/sandbox/http-proxy.ts
 --- a/src/sandbox/http-proxy.ts
 +++ b/src/sandbox/http-proxy.ts
-@@ -29,6 +29,7 @@
-   connectViaParentProxy,
-   dialDirect,
-   openConnectTunnel,
-+  resolvePublicAddress,
-   proxyAuthHeader,
-   selectParentProxyUrl,
-   shouldBypassParentProxy,
-@@ -186,6 +187,9 @@
- }
- 
+@@ -444,4 +444,7 @@
  export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 +  if (options.parentProxy) {
 +    throw new Error('Parent proxies are unsupported by public-only egress')
 +  }
-   const server = createServer()
- 
-   // A client that is killed mid-exchange (sandboxed process tree teardown)
-@@ -523,6 +527,9 @@
-       }
- 
+   // Before anything is set up: a runtime that cannot terminate TLS
+   // in-process fails here, not on each tunnel.
+   if (options.mitmCA) assertTlsTerminationSupported()
+@@ -916,4 +919,7 @@
        const mitmSocketPath = options.getMitmSocketPath?.(hostname)
 +      if (mitmSocketPath) {
 +        throw new Error('External MITM proxies are unsupported by public-only egress')
@@ -137,9 +129,7 @@ diff --git a/src/sandbox/http-proxy.ts b/src/sandbox/http-proxy.ts
        const parentUrl =
          !mitmSocketPath &&
          options.parentProxy &&
-@@ -715,6 +722,9 @@
- 
-       // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
+@@ -1108,4 +1114,7 @@
        const mitmSocketPath = options.getMitmSocketPath?.(hostname)
 +      if (mitmSocketPath) {
 +        throw new Error('External MITM proxies are unsupported by public-only egress')
@@ -147,26 +137,10 @@ diff --git a/src/sandbox/http-proxy.ts b/src/sandbox/http-proxy.ts
        const parentUrl =
          !mitmSocketPath &&
          options.parentProxy &&
-@@ -851,9 +861,14 @@
-         )
-       } else {
-         const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest
-+        const address = await resolvePublicAddress(hostname)
-+        if (req.socket.destroyed || res.destroyed) return
-         proxyReq = requestFn(
-           {
--            hostname,
-+            hostname: address,
-+            servername: isIP(hostname) ? '' : hostname,
-+            // Do not reuse a connection or delegate resolution to an env proxy.
-+            agent: false,
-             port,
-             path: url.pathname + url.search,
-             method: req.method,
 diff --git a/src/sandbox/socks-proxy.ts b/src/sandbox/socks-proxy.ts
 --- a/src/sandbox/socks-proxy.ts
 +++ b/src/sandbox/socks-proxy.ts
-@@ -79,6 +79,9 @@
+@@ -111,6 +111,9 @@
  export function createSocksProxyServer(
    options: SocksProxyServerOptions,
  ): SocksProxyWrapper {
@@ -179,48 +153,22 @@ diff --git a/src/sandbox/socks-proxy.ts b/src/sandbox/socks-proxy.ts
 diff --git a/src/sandbox/tls-terminate-proxy.ts b/src/sandbox/tls-terminate-proxy.ts
 --- a/src/sandbox/tls-terminate-proxy.ts
 +++ b/src/sandbox/tls-terminate-proxy.ts
-@@ -32,7 +32,7 @@
-   type GetBodySubstitutions,
- } from './body-substitution.js'
- import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
--import { stripHopByHop } from './parent-proxy.js'
-+import { resolvePublicAddress, stripHopByHop } from './parent-proxy.js'
- import { sha256Hex } from './aws-sigv4.js'
- import type { PlanSigv4 } from './credential-aws-pairs.js'
- 
-@@ -393,6 +393,4 @@
--  // Bun's https.request verifies the upstream cert against headers.host
--  // verbatim (including ":port"), which never matches a SAN. Drop the host
--  // header and let the runtime derive it from {host, port} — same wire value,
--  // correct verification under both Node and Bun.
-+  // Never forward the caller's Host. Restore the CONNECT authority after
-+  // request transformations, independently of the checked destination IP.
-   const fwdHeaders = stripHopByHop(req.headers)
-   delete fwdHeaders.host
-@@ -518,10 +516,24 @@
-     fwdHeaders['transfer-encoding'] = 'chunked'
-   }
- 
--  // TODO(terminating-tls): honour parentProxy for the upstream leg.
-+  let address: string
-+  try {
-+    address = await resolvePublicAddress(target.hostname)
-+  } catch {
-+    respondDenied(res, 'Destination is not public unicast')
-+    body.resume()
-+    return
-+  }
-+  if (req.socket.destroyed || res.destroyed) return
-+  // Dial the checked IP, but keep HTTP authority and TLS identity bound to
-+  // the original CONNECT target (never the untrusted request Host header).
-+  const authority = isIP(target.hostname) === 6
-+    ? `[${target.hostname}]` : target.hostname
-+  fwdHeaders.host = target.port === 443
-+    ? authority : `${authority}:${target.port}`
-   const upstream = httpsRequest(
-     {
--      host: target.hostname,
-+      host: address,
-       port: target.port,
-       path,
-       method: req.method,
+@@ -904,7 +904,7 @@
+ function createUpstreamLeg(target: TerminateTarget): UpstreamLeg {
+   const agent = new HttpsAgent({
+-    keepAlive: true,
++    keepAlive: false,
+     maxSockets: 1,
+     // We're a TLS-terminating proxy, not a trust boundary for the upstream
+     // server's identity — the runtime verifies it normally (system roots and
+     // NODE_EXTRA_CA_CERTS). Pin the identity to the tunnel's target so the
+@@ -919,7 +919,8 @@
+   return {
+     agent,
+     address() {
+-      if (!vetted) {
++      // Recheck every request, even inside one CONNECT tunnel.
++      {
+         const probe = directRequestOptions(
+           target.hostname,
+           target.port,

@@ -143,6 +143,21 @@ async def serve():
                 text="fake upstream rejected credentials",
                 headers={"X-Preview-Fixture": "upstream"},
             )
+        if request.path.startswith("/api/session/"):
+            session_id = request.path.rsplit("/", 1)[-1]
+            return web.json_response(
+                {
+                    "data": {
+                        "id": session_id,
+                        "location": {"directory": "/srv/opencode/workspaces/alpha"},
+                        **(
+                            {"parentID": "ses_alpha"}
+                            if session_id == "ses_child"
+                            else {}
+                        ),
+                    }
+                }
+            )
         return web.json_response(
             {
                 "path": request.raw_path,
@@ -363,6 +378,7 @@ def integration(wrapper, config_path, task):
                 "HOME": "/home/test-bot",
                 # Routing must use the trusted per-call metadata, not this env.
                 "OPENCODE_SESSION_ID": "ses_other",
+                "CREDENTIALS_DIRECTORY": "/etc/preview-test-credentials",
             },
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -421,16 +437,18 @@ def integration(wrapper, config_path, task):
                 },
             }
             await rpc("tools/call", params, error=-32602)
-            params["arguments"]["__opencode_session_id"] = "ses_other"
+            params["_meta"] = {"ai.opencode/sessionID": "ses_other"}
             await rpc("tools/call", params, error=-32000)
-            params["arguments"]["__opencode_session_id"] = "ses_alpha"
+            params["_meta"] = {"ai.opencode/sessionID": "ses_child"}
+            params["arguments"]["__opencode_session_id"] = "ses_forged"
             result = await rpc("tools/call", params)
             assert "alpha source:3" in json.dumps(result), result
             screenshot = await rpc(
                 "tools/call",
                 {
                     "name": "browser_take_screenshot",
-                    "arguments": {"type": "png", "__opencode_session_id": "ses_alpha"},
+                    "arguments": {"type": "png"},
+                    "_meta": {"ai.opencode/sessionID": "ses_alpha"},
                 },
             )
             process.stdin.close()
@@ -807,9 +825,9 @@ def integration(wrapper, config_path, task):
             "code": "async (page) => { "
             "const response = await page.goto('http://127.0.0.2:4096/health', "
             "{ timeout: 15000 }); "
-            # Pinned SRT maps the public-unicast policy exception to HTTP 500.
-            "if (response?.status() !== 500 || "
-            "await page.locator('body').innerText() !== 'Internal Server Error') "
+            # SRT maps rejected upstream destinations to HTTP 502.
+            "if (response?.status() !== 502 || "
+            "await page.locator('body').innerText() !== 'Bad Gateway') "
             "throw new Error('Private destination was not rejected by the proxy: ' + "
             "JSON.stringify({status: response?.status(), body: await page.locator('body').innerText()})); "
             "return response.status(); }"

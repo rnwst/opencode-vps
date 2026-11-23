@@ -1,18 +1,18 @@
 { pkgs }:
 pkgs.rustPlatform.buildRustPackage {
   pname = "searchfox-cli";
-  version = "0.20.5";
+  version = "0.21.0";
 
   src = pkgs.fetchFromGitHub {
     owner = "padenot";
     repo = "searchfox-cli";
-    rev = "d35ceeabf2258187af672a01072bddca2fffbbef";
-    hash = "sha256-dwCzEmvva/Z2WBtHqGkHApsWS12eWMhLf6nRmZ+WLeQ=";
+    tag = "v0.21.0";
+    hash = "sha256-IWLVZ13RTAaoGiB/dUdtdg/0wSMd8y0NCkg9HxeT/NY=";
   };
 
   patches = [ ./searchfox-cli-ca-bundle.patch ];
 
-  cargoHash = "sha256-biYl+hg4o2AUr4cCh1+0UzTnGIUDWYtwDLWXFxwX8gA=";
+  cargoHash = "sha256-wORNpdp9Mwkmnr3DcvTLCd1sCNVHRqoMrmZvOqCmbkY=";
   cargoBuildFlags = [ "--package=searchfox-cli" ];
   # Integration tests contact searchfox.org; run the offline unit tests instead.
   cargoTestFlags = [

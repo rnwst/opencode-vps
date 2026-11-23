@@ -142,6 +142,8 @@ elif mode == "other-session":
                 (errno.ENOENT, errno.ECONNREFUSED),
             )
 elif mode == "inside":
+    assert "OPENCODE_PASSWORD" not in os.environ
+    assert "OPENCODE_SERVER_PASSWORD" not in os.environ
     assert os.environ["TMPDIR"] == "/tmp/claude"
     upload = Path(os.environ["MOZ_UPLOAD_DIR"])
     assert upload == Path("/tmp/mozilla-artifacts")

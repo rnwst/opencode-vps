@@ -1,25 +1,12 @@
 diff --git a/vendor/seccomp-src/seccomp-unix-block.c b/vendor/seccomp-src/seccomp-unix-block.c
 --- a/vendor/seccomp-src/seccomp-unix-block.c
 +++ b/vendor/seccomp-src/seccomp-unix-block.c
-@@ -55,10 +55,15 @@
--    if (argc < 2 || argc > 3) {
--        fprintf(stderr, "Usage: %s <output-file> [x86_64|aarch64]\n", argv[0]);
-+    if (argc < 2 || argc > 4 ||
-+        (argc == 4 && strcmp(argv[3], "--allow-unix-sockets") != 0)) {
-+        fprintf(stderr, "Usage: %s <output-file> [x86_64|aarch64] [--allow-unix-sockets]\n", argv[0]);
-         return 1;
-     }
-
-     const char *output_file = argv[1];
--    const char *arch_name = (argc == 3) ? argv[2] : NULL;
-+    const char *arch_name = (argc >= 3) ? argv[2] : NULL;
-+    /* Local IPC is safe only after the host launcher removes host/broker
-+     * socket paths from the workload's filesystem view. Keep the remaining
-+     * filter rules (including io_uring denial) in both profiles. */
-+    int allow_unix_sockets = argc == 4;
-
-     /* Create seccomp context with default action ALLOW */
-     ctx = seccomp_init(SCMP_ACT_ALLOW);
+@@ -159,2 +159,5 @@
+     const char *rule_set = (argc == 4) ? argv[3] : "unix";
++    /* Keep io_uring denied while permitting isolated local IPC. */
++    int allow_unix_sockets = strcmp(rule_set, "--allow-unix-sockets") == 0;
++    if (allow_unix_sockets) rule_set = "unix";
+     if (strcmp(rule_set, "unix") != 0 && strcmp(rule_set, "namespaces") != 0) {
 @@ -99,9 +104,11 @@
 -    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
 -                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
@@ -37,18 +24,20 @@ diff --git a/vendor/seccomp-src/seccomp-unix-block.c b/vendor/seccomp-src/seccom
 +        }
      }
 
-     /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets
+     /* Add rule to block socket(AF_VSOCK, ...) */
 diff --git a/vendor/seccomp-src/apply-seccomp.c b/vendor/seccomp-src/apply-seccomp.c
 --- a/vendor/seccomp-src/apply-seccomp.c
 +++ b/vendor/seccomp-src/apply-seccomp.c
-@@ -57,5 +57,6 @@
+@@ -69,6 +69,8 @@
  #include <linux/bpf_common.h>
 
  #include "unix-block-bpf.h"
 +#include "unix-allow-bpf.h"
++#include "namespace-block-bpf.h"
 
  #ifndef PR_SET_NO_NEW_PRIVS
-@@ -666,10 +667,22 @@
+ #define PR_SET_NO_NEW_PRIVS 38
+@@ -679,2 +680,10 @@
      char **command_argv = &argv[1];
 +    int allow_unix_sockets = strcmp(argv[1], "--allow-unix-sockets") == 0;
 +    if (allow_unix_sockets) {
@@ -59,6 +48,7 @@ diff --git a/vendor/seccomp-src/apply-seccomp.c b/vendor/seccomp-src/apply-secco
 +        command_argv++;
 +    }
 
+@@ -688,9 +697,13 @@
      _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
                     "BPF filter size must be a multiple of sock_filter");
 +    _Static_assert(sizeof(unix_allow_bpf) % sizeof(struct sock_filter) == 0,
@@ -71,5 +61,6 @@ diff --git a/vendor/seccomp-src/apply-seccomp.c b/vendor/seccomp-src/apply-secco
 +        .filter = (struct sock_filter *)(allow_unix_sockets
 +                                        ? unix_allow_bpf : unix_block_bpf),
      };
-
-     /* ---- Optional observation: pre-fork setup --------------------------- */
+     _Static_assert(sizeof(namespace_block_bpf) % sizeof(struct sock_filter) == 0,
+                    "BPF filter size must be a multiple of sock_filter");
+     struct sock_fprog namespace_prog = {

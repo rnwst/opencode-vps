@@ -1037,64 +1037,85 @@ class OpenCodeClient:
         path: str,
         directory: str | None = None,
         body: dict[str, Any] | None = None,
+        allow_status: Iterable[int] = (),
     ) -> tuple[int, Any]:
         url = self.base_url + path
         if directory:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(
                 {"directory": directory}
             )
-        status, payload, _ = self.http.request(method, url, self.headers, body)
+        status, payload, _ = self.http.request(
+            method, url, self.headers, body, allow_status=allow_status
+        )
         return status, payload
 
     def create_session(self, directory: str, title: str) -> str:
-        _, payload = self.request("POST", "/session", directory, {"title": title})
+        _, response = self.request(
+            "POST",
+            "/api/session",
+            body={"title": title, "location": {"directory": directory}},
+        )
+        payload = response.get("data") if isinstance(response, dict) else None
         if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
             raise BridgeError("OpenCode returned an invalid session")
         return payload["id"]
 
     def find_session(self, directory: str, title: str) -> str | None:
-        _, payload = self.request("GET", "/session", directory)
-        if not isinstance(payload, list):
-            raise BridgeError("OpenCode returned an invalid session list")
-        matches = [
-            item.get("id")
-            for item in payload
-            if isinstance(item, dict) and item.get("title") == title
-        ]
+        matches = []
+        path = "/api/session"
+        seen = set()
+        while True:
+            _, payload = self.request("GET", path, directory)
+            if not isinstance(payload, dict) or not isinstance(
+                payload.get("data"), list
+            ):
+                raise BridgeError("OpenCode returned an invalid session list")
+            matches.extend(
+                item["id"]
+                for item in payload["data"]
+                if item.get("title") == title
+                and item.get("location", {}).get("directory") == directory
+            )
+            cursor = payload.get("cursor", {}).get("next")
+            if not cursor:
+                break
+            if cursor in seen:
+                raise BridgeError("OpenCode returned a repeated session cursor")
+            seen.add(cursor)
+            path = "/api/session?" + urllib.parse.urlencode({"cursor": cursor})
         if len(matches) > 1:
             raise BridgeError("multiple OpenCode sessions match the task title")
         return matches[0] if matches else None
 
     def validate_model(self, directory: str, provider_id: str, model_id: str) -> None:
-        _, payload = self.request("GET", "/config/providers", directory)
-        providers = payload.get("providers") if isinstance(payload, dict) else None
-        if not isinstance(providers, list):
-            raise BridgeError("OpenCode returned an invalid provider list")
-        for provider in providers:
-            if provider.get("id") != provider_id:
-                continue
-            models = provider.get("models") or {}
-            if isinstance(models, dict) and model_id in models:
-                return
-            if isinstance(models, list) and any(
-                model.get("id") == model_id for model in models
-            ):
+        _, payload = self.request(
+            "GET",
+            "/api/model?" + urllib.parse.urlencode({"location[directory]": directory}),
+        )
+        models = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            raise BridgeError("OpenCode returned an invalid model list")
+        for model in models:
+            if model.get("providerID") == provider_id and model.get("id") == model_id:
                 return
         raise BridgeError(
             f"configured OpenCode model is unavailable: {provider_id}/{model_id}"
         )
 
     def get_session(self, session_id: str, directory: str) -> dict[str, Any]:
-        _, payload = self.request(
-            "GET", f"/session/{urllib.parse.quote(session_id)}", directory
+        _, response = self.request(
+            "GET", f"/api/session/{urllib.parse.quote(session_id)}"
         )
+        payload = response.get("data") if isinstance(response, dict) else None
         if not isinstance(payload, dict):
             raise BridgeError("OpenCode returned an invalid session")
-        return payload
+        return payload | {"directory": payload.get("location", {}).get("directory")}
 
     def statuses(self, directory: str) -> dict[str, Any]:
-        _, payload = self.request("GET", "/session/status", directory)
-        return payload if isinstance(payload, dict) else {}
+        _, payload = self.request("GET", "/api/session/active")
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+            raise BridgeError("OpenCode returned an invalid active-session list")
+        return {session_id: {"type": "busy"} for session_id in payload["data"]}
 
     def prompt(
         self,
@@ -1107,39 +1128,64 @@ class OpenCodeClient:
         system_text: str,
         context_text: str,
     ) -> None:
-        body = {
-            "messageID": message_id,
-            "agent": agent,
-            "model": {"providerID": provider_id, "modelID": model_id},
-            "system": system_text,
-            "parts": [{"type": "text", "text": context_text}],
-        }
+        path = f"/api/session/{urllib.parse.quote(session_id)}"
+        self.request("POST", path + "/agent", body={"agent": agent})
         self.request(
             "POST",
-            f"/session/{urllib.parse.quote(session_id)}/prompt_async",
-            directory,
-            body,
+            path + "/model",
+            body={"model": {"providerID": provider_id, "id": model_id}},
+        )
+        self.request(
+            "PUT",
+            f"/api/experimental/session/{urllib.parse.quote(session_id)}/instructions/entries/github-bridge",
+            body={"value": system_text},
+        )
+        body = {"id": message_id, "text": context_text, "delivery": "queue"}
+        self.request(
+            "POST",
+            path + "/prompt",
+            body=body,
         )
 
     def message_exists(self, session_id: str, directory: str, message_id: str) -> bool:
-        _, payload = self.request(
-            "GET", f"/session/{urllib.parse.quote(session_id)}/message", directory
+        path = f"/api/session/{urllib.parse.quote(session_id)}"
+        # Admission is durable before a message is projected into history.
+        _, inbox = self.request("GET", path + "/inbox")
+        if not isinstance(inbox, dict) or not isinstance(inbox.get("data"), list):
+            raise BridgeError("OpenCode returned an invalid inbox")
+        if any(item.get("id") == message_id for item in inbox["data"]):
+            return True
+        status, payload = self.request(
+            "GET",
+            path + "/message/" + urllib.parse.quote(message_id),
+            allow_status=(404,),
         )
-        if not isinstance(payload, list):
+        if status == 404:
             return False
-        return any(
-            item.get("info", {}).get("id") == message_id
-            for item in payload
-            if isinstance(item, dict)
-        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("data", {}).get("id") != message_id
+        ):
+            raise BridgeError("OpenCode returned an invalid message")
+        return True
 
     def abort(self, session_id: str, directory: str) -> None:
+        path = f"/api/session/{urllib.parse.quote(session_id)}"
         self.request(
-            "POST", f"/session/{urllib.parse.quote(session_id)}/abort", directory, {}
+            "POST",
+            path + "/interrupt",
+            body={"resume": False},
         )
+        # V2 interruption leaves durable queued inputs in the inbox. Remove
+        # them too, so a later continue cannot revive a cancelled assignment.
+        _, inbox = self.request("GET", path + "/inbox")
+        if not isinstance(inbox, dict) or not isinstance(inbox.get("data"), list):
+            raise BridgeError("OpenCode returned an invalid inbox")
+        for item in inbox["data"]:
+            self.request("DELETE", path + "/inbox/" + urllib.parse.quote(item["id"]))
 
     def delete(self, session_id: str, directory: str) -> None:
-        self.request("DELETE", f"/session/{urllib.parse.quote(session_id)}", directory)
+        self.request("DELETE", f"/api/session/{urllib.parse.quote(session_id)}")
 
 
 class WorkspaceManager:
@@ -2674,7 +2720,7 @@ class Bridge:
             raise BridgeError("managed request has an invalid expiry")
 
         session_id = str(data.get("session_id") or "")
-        if not re.fullmatch(r"ses_[A-Za-z0-9]+", session_id):
+        if not re.fullmatch(r"ses_?[A-Za-z0-9]+", session_id):
             raise BridgeError("invalid OpenCode session ID")
         raw_directory = str(data.get("directory") or "")
         directory = Path(raw_directory).resolve()

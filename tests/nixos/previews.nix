@@ -61,6 +61,7 @@ pkgs.testers.nixosTest {
     # Exercise pool-local OOM without a panic, but still fail on VM-wide OOM.
     boot.kernel.sysctl."vm.panic_on_oom" = lib.mkForce 1;
     networking.firewall.enable = false;
+    environment.etc."preview-test-credentials/server-password".source = settings.secrets.serverPassword;
     users.groups.agent-workspaces = { };
     users.users.${settings.accounts.bot.name} = {
       isSystemUser = true;

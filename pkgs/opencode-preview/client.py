@@ -13,7 +13,7 @@ from pathlib import Path
 import aiohttp
 
 MAX_FRAME = 256 * 1024
-SESSION = re.compile(r"ses_[A-Za-z0-9]+\Z")
+SESSION = re.compile(r"ses_?[A-Za-z0-9]+\Z")
 
 
 async def request(config, endpoint, body):
@@ -104,7 +104,9 @@ def main():
                 {"session_id": options.session, "directory": options.directory},
             )
         )
-    session = os.environ.get("OPENCODE_SESSION_ID")
+    session = os.environ.get("OPENCODE_MANAGED_SESSION_ID") or os.environ.get(
+        "OPENCODE_SESSION_ID"
+    )
     if session is None:
         # Fallback is fixed by installed configuration, never a caller-selected
         # executable or runtime environment selector.
