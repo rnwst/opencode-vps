@@ -418,7 +418,7 @@ label of `publicHostName`: `opencode.example.com` becomes `example.com`.
 | `maxPorts` | `128` | Distinct ports discovered over one runtime's lifetime |
 | `maxConnections` | `128` | Per-runtime connection/channel limit |
 | `memoryMax` | `9663676416` (9 GiB) | Combined cgroup memory ceiling for all runtimes, in bytes |
-| `tasksMax` | `512` | Per-runtime cgroup process/thread limit |
+| `tasksMax` | `1024` | Per-runtime cgroup process/thread limit |
 | `maxLifetimeSeconds` | `86400` | Maximum runtime age (24 hours) |
 | `idleTimeoutSeconds` | `300` | Retire empty runtimes after five idle minutes |
 

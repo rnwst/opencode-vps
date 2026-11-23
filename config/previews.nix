@@ -15,7 +15,7 @@ assert lib.assertMsg (
   maxPorts = 128;
   maxConnections = 128;
   memoryMax = 9663676416;
-  tasksMax = 512;
+  tasksMax = 1024;
   maxLifetimeSeconds = 86400;
   idleTimeoutSeconds = 300;
 }
