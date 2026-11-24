@@ -469,10 +469,16 @@ commit them. Deployment examples here use only placeholder domains and IDs.
 | `githubReviewer` | GitHub login to request as PR reviewer, not the bridge's authorization identity |
 
 Homes derive from the account names as `/home/<ADMIN_USER>` and
-`/home/<BOT_USER>`. Git identities are configured per user, not system-wide or
-by repository ownership; normal admin Git uses the admin identity, while agent
-Git and `opencode-git` use the bot identity. These are independent of the token's
-GitHub login (`<BOT_LOGIN>`), which the bridge discovers from the token.
+`/home/<BOT_USER>`. Normal admin Git uses the admin identity. Agent Git and
+`opencode-git` default to the admin as author in manual workspaces and the bot
+as author in GitHub bridge workspaces under `${workspacesRoot}/.tasks`. Their
+default committer is always the bot; outside managed workspaces, the default
+author is also the bot. Ordered Git conditional includes apply these defaults
+to existing and new repositories, including commands using `git -C`.
+Repository-local `author.name` and `author.email`, `--author`, and Git identity
+environment variables can override the author defaults. These identities are
+independent of the token's GitHub login (`<BOT_LOGIN>`), which the bridge
+discovers from the token.
 Replace all angle-bracket placeholders before running examples.
 
 Changing an existing username is not an automatic migration: plan migration of

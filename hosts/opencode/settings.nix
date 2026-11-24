@@ -8,8 +8,9 @@
   hostName = "opencode";
   publicHostName = "opencode.example.com";
 
-  # Unix accounts have homes at /home/<name>. Git identities are per-account,
-  # independent of repository ownership and the GitHub token's account.
+  # Unix accounts have homes at /home/<name>. Agent commits use the admin as
+  # author in manual workspaces and the bot in .tasks; the committer is the bot.
+  # Git identities are independent of ownership and the GitHub token's account.
   accounts = {
     admin = {
       name = "opencode-admin";

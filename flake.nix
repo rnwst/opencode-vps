@@ -73,6 +73,7 @@
       };
 
       checks.${system} = {
+        git-identity = import ./tests/git-identity { inherit pkgs home-manager; };
         searchfox-cli = import ./tests/searchfox-cli {
           inherit pkgs;
           searchfoxCli = localPackages.searchfox-cli;
