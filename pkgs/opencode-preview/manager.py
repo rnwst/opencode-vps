@@ -505,9 +505,20 @@ class Manager:
             for runtime in self.runtimes.values():
                 if runtime.directory == str(root):
                     if runtime.session_id != session:
-                        raise web.HTTPConflict(
-                            text="workspace already has an active session"
-                        )
+                        blocker = self._idle_blocker(runtime)
+                        if blocker:
+                            raise web.HTTPConflict(
+                                text=(
+                                    "workspace already has an active session "
+                                    f"{runtime.session_id}: {blocker}. "
+                                    "Wait for it to become idle, close its browser/background "
+                                    "work, or use a separate workspace."
+                                )
+                            )
+                        # Keep admission locked until teardown has finished. stop()
+                        # marks the old runtime unavailable before its first await.
+                        await self._retire_idle_runtime(runtime)
+                        break
                     if runtime.stopped or not self._valid(runtime):
                         self._background_stop(runtime.runtime_id)
                         raise web.HTTPConflict(text="workspace runtime is stopping")
@@ -524,14 +535,7 @@ class Manager:
                 )
                 if candidate is None:
                     raise web.HTTPServiceUnavailable(text="runtime limit reached")
-                try:
-                    await self.stop(candidate.runtime_id)
-                except (OSError, RuntimeError, asyncio.TimeoutError):
-                    raise web.HTTPServiceUnavailable(
-                        text="idle runtime cleanup failed"
-                    ) from None
-                if self.closing:
-                    raise web.HTTPServiceUnavailable(text="manager is stopping")
+                await self._retire_idle_runtime(candidate)
             slug = workspace_slug(relative)
             if any(r.slug == slug for r in self.runtimes.values()):
                 raise web.HTTPConflict(text="workspace hostname collision")
@@ -595,21 +599,43 @@ class Manager:
                 ):
                     self._background_stop(runtime.runtime_id)
 
+    def _idle_blocker(self, runtime):
+        if runtime.stopped:
+            return "runtime is stopping"
+        if not runtime.started:
+            return "runtime is starting"
+        kinds = {kind for kind, _ in runtime.channels.values()}
+        if runtime.active_execs or "exec" in kinds:
+            return "shell commands are running or finishing"
+        if runtime.active_mcp is not None or "mcp" in kinds:
+            return "a browser tool call is running or finishing"
+        if runtime.reported_ports or runtime.listeners:
+            return "listening ports remain open"
+        if runtime.connections or "tcp" in kinds:
+            return "preview connections remain open"
+        if runtime.processes:
+            return "background processes (including browsers) remain running"
+        if (
+            runtime.processes is None
+            or runtime.last_heartbeat <= runtime.last_exec_activity
+        ):
+            return "waiting for the supervisor to confirm it is idle"
+        if not self._valid(runtime):
+            return "runtime needs cleanup"
+        return None
+
     def _idle(self, runtime):
-        return (
-            runtime.started
-            and not runtime.stopped
-            and not runtime.active_execs
-            and runtime.active_mcp is None
-            and not any(
-                kind in {"exec", "mcp"} for kind, _ in runtime.channels.values()
-            )
-            and not runtime.reported_ports
-            and not runtime.listeners
-            and runtime.processes == 0
-            and runtime.last_heartbeat > runtime.last_exec_activity
-            and self._valid(runtime)
-        )
+        return self._idle_blocker(runtime) is None
+
+    async def _retire_idle_runtime(self, runtime):
+        try:
+            await self.stop(runtime.runtime_id)
+        except (OSError, RuntimeError, asyncio.TimeoutError):
+            raise web.HTTPServiceUnavailable(
+                text="idle runtime cleanup failed"
+            ) from None
+        if self.closing:
+            raise web.HTTPServiceUnavailable(text="manager is stopping")
 
     def _background_stop(self, runtime_id):
         if runtime_id not in self.stopping and runtime_id in self.runtimes:

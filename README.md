@@ -70,10 +70,12 @@ mapping; deleting a child does not stop or remove the root's runtime or files.
 With previews enabled, shell calls in the same conversation/workspace share a
 persistent runtime and private network namespace:
 background processes and loopback listeners survive between calls, without
-exposing host ports or another session's listeners. Shell variables and changes
-to the working directory do not carry over; each call starts a new shell.
-Only one root conversation can own an active runtime and publish previews per
-workspace, including calls from its subagents.
+exposing host ports or another session's listeners. Idle handoff fully stops
+the old runtime before starting a separate one for the new conversation; each
+conversation's private `/tmp` files are preserved. The five-minute idle timeout
+cleans up unused runtimes when no conversation requests a handoff. See
+[session and workspace concurrency](#session-and-workspace-concurrency) for
+handoff conditions and command limits.
 CLI calls without `OPENCODE_SESSION_ID` retain the existing single-shot sandbox
 behavior, with a fresh network namespace and teardown after each invocation.
 Outbound TCP uses SRT's public-destination-only proxy;
@@ -107,9 +109,8 @@ MCP server. The MCP package and matching Chromium headless shell (Blink), Firefo
 or browser download is needed. Chromium is the default. Call
 `tools.playwright.browser_select` with `{"browser":"firefox"}`, `{"browser":"webkit"}`,
 or `{"browser":"chromium"}` to select the engine for the current session runtime.
-Changing engines closes the old browser and removes its state and output files;
-selecting the current engine preserves them. Other sessions are unaffected.
-The choice survives browser closure/errors but resets when the runtime expires.
+See [browser state and output](#browser-state-and-output) for engine-switching
+and cleanup limitations.
 
 OpenCode shares MCP connections across conversations and supplies the calling
 session in MCP `_meta["ai.opencode/sessionID"]`. The stdio adapter resolves its
@@ -140,16 +141,11 @@ All engines use the isolated local-IPC environment below. Chromium's inner
 sandbox remains disabled because the mandatory outer bubblewrap/seccomp
 sandbox already applies. No host CDP endpoint or public MCP listener is exposed.
 
-Browser state persists between calls within a session. Closing the browser or
-its last tab retires the MCP helper so an otherwise idle runtime can expire.
-Tool errors and cancellation also reset the browser. A nested PID namespace
+Browser state persists between calls within a session. A nested PID namespace
 contains detached browser processes; if bounded cleanup cannot be confirmed,
 the entire session runtime stops rather than leaving processes behind.
-Screenshots can be returned inline; file output lives under the session-private
-`/tmp` and must be read through that session's shell tools before browser reset
-or closure. Browser-private files are removed only after process teardown.
-Playwright MCP is disabled when previews are disabled, rather than falling back
-to an unsandboxed host browser.
+Screenshots can be returned inline; browser-private files are removed only
+after process teardown.
 
 ### Shell Sandbox Security
 
@@ -190,9 +186,8 @@ The host hardens the pinned Sandbox Runtime package and its launcher:
   fallback mode, command completion, including nonzero exits, shuts down the
   proxy and removes the broker directory.
 
-Upstream HTTP proxy configuration (`HTTP_PROXY`, `HTTPS_PROXY`, and lowercase
-equivalents) and external MITM routing are unsupported by this host build: an
-upstream proxy could resolve destinations differently and bypass these checks.
+See [networking and local CI](#networking-and-local-ci) for unsupported upstream
+proxy configurations.
 IPv6 egress is conservatively limited to native global-unicast space. Do not
 introduce network-specific NAT64 translation or host routing that maps otherwise
 public destinations into private networks without extending the egress policy.
@@ -250,12 +245,11 @@ also has read/write ACL access to the bot home for direct maintenance. This
 includes OpenCode state and ChatGPT OAuth credentials, so processes running as
 admin must be treated as fully trusted; admin already has passwordless sudo.
 
-`act` is not a perfect reproduction of GitHub-hosted Actions. CI containers
-share the VPS kernel and can consume host resources, but they run as
-`ci-runner`, receive no OpenCode, GitHub, SSH, or Cloudflare credentials, and
-operate on a disposable copy rather than the source worktree. `ci-runner`
-uses only its own rootless Docker socket; rootful Docker is disabled, and agent
-shell commands cannot create Unix sockets.
+CI containers run as `ci-runner`, receive no OpenCode, GitHub, SSH, or Cloudflare
+credentials, and operate on a disposable copy rather than the source worktree.
+`ci-runner` uses only its own rootless Docker socket; rootful Docker is disabled,
+and agent shell commands cannot create Unix sockets. See
+[networking and local CI](#networking-and-local-ci) for compatibility limits.
 
 Canonical repositories live outside the workspace tree under
 `/var/lib/opencode-task-bases`. Every automated GitHub task receives a writable
@@ -266,6 +260,93 @@ directly below `/srv/opencode/workspaces` and are never collected automatically.
 Automated names remain unique while identifying their GitHub subject, for
 example `task-example-project-pr-6-5eeebd5902cc`. OpenCode clients use this
 directory basename as the workspace label.
+
+## Known limitations
+
+### Session and workspace concurrency
+
+Only one root conversation can own an active runtime and publish previews per
+workspace, including calls from its subagents. This applies to ordinary shell
+commands and Playwright calls, even when no web preview has been started.
+Overlapping activity from separate root conversations in the same workspace
+remains unsupported. A conflict identifies the owning session and the activity
+preventing handoff. Wait for it to finish, close its browser/background work, or
+use separate workspaces/worktrees for concurrent work.
+
+Another conversation can take over immediately once the supervisor confirms
+the runtime is idle: no running or finishing calls, background processes
+(including browsers), listening ports, or preview connections. There is no
+five-minute handoff delay; that timeout only cleans up unused runtimes.
+
+Subagents share their root conversation's runtime, including browser state and
+temporary files. Up to `maxExecs` shell calls (four by default) can run at once,
+with independent output, exit status, and cancellation. Starting, draining, and
+terminating calls count toward the limit; excess calls are rejected, not queued.
+Parallelize independent commands, not operations that contend for Git state or
+the same build files. Browser calls remain serialized. Shell variables and
+changes to the working directory do not carry over; each call starts a new shell.
+
+### Browser state and output
+
+Changing Playwright engines closes the old browser and removes its state and
+output files; selecting the current engine preserves them. Other sessions are
+unaffected. The choice survives browser closure/errors but resets when the
+runtime expires.
+
+Closing the browser or its last tab retires the MCP helper so an otherwise idle
+runtime can expire. Tool errors and cancellation also reset the browser. File
+output lives under the session-private `/tmp` and must be read through that
+session's shell tools before browser reset or closure. Playwright MCP is disabled
+when previews are disabled, rather than falling back to an unsandboxed host
+browser.
+
+### Preview compatibility
+
+- Previews forward HTTP and WebSockets, not arbitrary TCP or UDP traffic.
+  SRT's internal proxy ports are excluded.
+- Preview apps cannot register service workers: registration is blocked so an
+  untrusted app cannot intercept the trusted preview login endpoint. PWA/offline
+  flows requiring a service worker are unsupported.
+- The gateway strips `Authorization` and proxy-authentication headers before
+  forwarding to apps. Application cookies other than the gateway cookie remain
+  available for cookie-based app authentication.
+- Previews must be opened in a browser; the listed mobile apps do not display them.
+- Runtimes without listening ports have no entry in `/previews`, so they cannot
+  be stopped from that directory. Use the operator stop command in
+  [Development Previews](#development-previews).
+
+See [App Compatibility](#app-compatibility) for host validation, HMR, and CORS
+configuration, and [Security Boundaries](#security-boundaries) for same-site
+cookie and origin limitations.
+
+### Networking and local CI
+
+Upstream HTTP proxy configuration (`HTTP_PROXY`, `HTTPS_PROXY`, and lowercase
+equivalents) and external MITM routing are unsupported by this host build: an
+upstream proxy could resolve destinations differently and bypass the sandbox's
+destination checks. See [Shell Sandbox Security](#shell-sandbox-security) for
+the supported network policy.
+
+`act` is not a perfect reproduction of GitHub-hosted Actions. CI containers
+share the VPS kernel and can consume host resources. A successful local run
+does not guarantee that remote checks will pass.
+
+### Stale model lists
+
+Existing workspaces can retain old model lists despite a new conversation or
+browser reload. Restart OpenCode after active agent work finishes to refresh
+them; see the [refresh procedure](#model-catalog-refresh).
+
+### GitHub automation
+
+No separate automation reacts to failed checks or merge conflicts. Agents run
+`ci_run` before finishing; later remote-only failures or conflicts must be sent
+back to the mapped session explicitly:
+
+```text
+@<BOT_LOGIN> continue Fix the failing remote checks.
+@<BOT_LOGIN> continue Rebase this branch and resolve the conflicts.
+```
 
 ## Repository Layout
 
@@ -477,9 +558,9 @@ leaves events pending if that model is unavailable.
 ### Model Catalog Refresh
 
 OpenCode refreshes its catalog at startup and approximately hourly, independently
-of application updates. Existing workspaces can retain old model lists despite
-a new conversation or browser reload. To reload them, wait for active agent work
-to finish, then run on the VPS:
+of application updates. To work around the
+[workspace catalog limitation](#stale-model-lists), wait for active agent
+work to finish, then run on the VPS:
 
 ```bash
 sudo systemctl restart opencode.service
@@ -1027,14 +1108,8 @@ notifications from unexpectedly starting historical work. When deploying the
 committed live default directly, verify that the first baseline poll completes
 before creating a new actionable comment, assignment, or review request.
 
-No separate automation reacts to failed checks or merge conflicts. Agents run
-`ci_run` before finishing; later remote-only failures or conflicts can be sent
-back to the mapped session explicitly:
-
-```text
-@<BOT_LOGIN> continue Fix the failing remote checks.
-@<BOT_LOGIN> continue Rebase this branch and resolve the conflicts.
-```
+See [GitHub automation limitations](#github-automation) for follow-up after
+remote check failures or merge conflicts.
 
 ## Clients And Sessions
 
@@ -1062,8 +1137,8 @@ There are two community OpenCode mobile app options I have tested:
 on both iOS and Android, but appears to be much less polished than [`dzianisv`'s
 app](https://github.com/dzianisv/opencode-mobile), which only works on Android.
 OpenCode can of course also be used in a mobile browser, but the apps support
-voice input and mobile permission handling. To view previews, the browser must
-be used.
+voice input and mobile permission handling. See
+[preview compatibility](#preview-compatibility) for their preview limitation.
 
 ## Development Previews
 
@@ -1077,15 +1152,9 @@ python -m http.server 3000 --bind 127.0.0.1 > /tmp/preview.log 2>&1 &
 Use the project's normal dev-server command instead when appropriate. The
 runtime survives the shell call, and later calls in the same session can reach
 `127.0.0.1:3000` directly (bypass HTTP proxy environment variables for local
-clients, for example `curl --noproxy '*' http://127.0.0.1:3000/`). Persistence
-means processes and shared loopback, not retained shell variables or `cd` state.
-Subagents share their root conversation's runtime, including browser state and
-temporary files. Up to `maxExecs` shell calls (four by default) can run at once,
-with independent output, exit status, and cancellation. Starting, draining, and
-terminating calls count toward the limit; excess calls are rejected, not queued.
-Parallelize independent commands, not operations that contend for Git state or
-the same build files. Browser calls remain serialized. Unrelated conversations
-cannot share that runtime; stop its runtime before switching ownership.
+clients, for example `curl --noproxy '*' http://127.0.0.1:3000/`). See
+[session and workspace concurrency](#session-and-workspace-concurrency) for
+shell/browser limits and idle handoff between conversations.
 
 Visit the trusted Basic-authenticated directory at
 `https://opencode.example.com/previews`. It lists workspace, session, port, and
@@ -1126,9 +1195,9 @@ names when successive projects need distinct browser origins.
 background processes, not the OpenCode session or conversation. The next shell
 call from the same owner creates a fresh runtime. Runtime reset does not delete
 session-private temporary files; the existing session/workspace deletion hook
-removes those separately. If a runtime has no listening ports, it has no directory
-entry to stop. An operator can stop it with the exact session ID and workspace
-root path:
+removes those separately. An operator can also stop a runtime with the exact
+session ID and workspace root path, including runtimes
+[absent from the directory](#preview-compatibility):
 
 ```bash
 sudo -u <BOT_USER> opencode-session-exec stop \
@@ -1144,8 +1213,8 @@ access the private runtime control socket from an agent shell.
 All discovered app HTTP ports are published automatically, including debug and
 administration endpoints, within configured limits. They are accessible to an
 authenticated browser, not just the agent. Start only servers you intend to
-expose. This is HTTP and WebSocket forwarding, not arbitrary TCP or UDP access;
-SRT's internal proxy ports are excluded.
+expose. See [preview compatibility limitations](#preview-compatibility) for
+supported protocols, service workers, and application authentication.
 
 Configure dev-server host validation for the exact public preview hostname.
 Shells receive `OPENCODE_PREVIEW_URL_TEMPLATE`; replace its literal `{port}`
@@ -1164,13 +1233,6 @@ between sessions. First visit the API host's login link to establish its
 host-only cookie, then use `credentials: "include"` for cross-origin fetches;
 preflight methods and headers remain restricted. Do not blanket-disable CORS
 or origin checks to work around configuration errors.
-
-Service-worker registration is blocked in this initial implementation so an
-untrusted app cannot intercept the trusted preview login endpoint. PWA/offline
-flows requiring a service worker are therefore unsupported.
-The gateway strips `Authorization` and proxy-authentication headers before
-forwarding to apps; application cookies other than the gateway cookie remain
-available for cookie-based app authentication.
 
 ### Security Boundaries
 

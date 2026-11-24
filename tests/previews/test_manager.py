@@ -292,7 +292,9 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.manager.spawned), 1)
         async with await self.execute(session_id="ses_other") as response:
             self.assertEqual(response.status, 409)
-            self.assertNotIn("ses_one", await response.text())
+            detail = await response.text()
+            self.assertIn("ses_one", detail)
+            self.assertIn("waiting for the supervisor", detail)
         runtime = self.manager.spawned[0]
         self.assertLessEqual(
             {frame["op"] for frame in runtime.process.frames}, {"exec", "exec_credit"}
@@ -661,16 +663,150 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             await response.read()
         self.assertNotIn(runtime.runtime_id, self.manager.runtimes)
 
-    async def test_empty_runtime_does_not_transfer_workspace_session(self):
-        runtime = await self.runtime()
-        await self.heartbeat(runtime, processes=0)
+    async def test_idle_handoff_preserves_files_and_requires_confirmation(self):
+        async with await self.execute() as response:
+            await response.read()
+        runtime = self.manager.spawned[0]
+        temporary = runtime.session_tmp / "keep"
+        temporary.write_text("first session")
         async with await self.execute(session_id="ses_other") as response:
             self.assertEqual(response.status, 409)
+            self.assertIn("waiting for the supervisor", await response.text())
+        await self.heartbeat(runtime, processes=0)
+        async with await self.execute(session_id="ses_other") as response:
+            self.assertEqual(response.status, 200)
             await response.read()
-        self.assertIn(runtime.runtime_id, self.manager.runtimes)
+        replacement = self.manager.spawned[-1]
+        self.assertEqual(self.manager.killed, [runtime.runtime_id])
+        self.assertNotIn(runtime.runtime_id, self.manager.runtimes)
+        self.assertNotEqual(replacement.session_tmp, runtime.session_tmp)
+        self.assertFalse((replacement.session_tmp / "keep").exists())
+        self.assertEqual(temporary.read_text(), "first session")
+        await self.heartbeat(replacement, processes=0)
         async with await self.execute() as response:
             self.assertEqual(response.status, 200)
             await response.read()
+        self.assertEqual(self.manager.spawned[-1].session_tmp, runtime.session_tmp)
+        self.assertEqual(temporary.read_text(), "first session")
+
+    async def test_idle_handoff_serializes_cleanup_and_competing_shells(self):
+        runtime = await self.runtime()
+        await self.heartbeat(runtime, processes=0)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_kill = self.manager._kill_cgroup
+
+        async def delayed_cleanup(old):
+            self.assertIs(old, runtime)
+            entered.set()
+            await release.wait()
+            await original_kill(old)
+
+        with patch.object(self.manager, "_kill_cgroup", delayed_cleanup):
+            handoff = asyncio.create_task(
+                self.execute(session_id="ses_other", argv=["hold"])
+            )
+            competitors = []
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                self.assertTrue(runtime.stopped)
+                competitors = [
+                    asyncio.create_task(self.execute(session_id=session))
+                    for session in ("ses_one", "ses_third")
+                ]
+                await asyncio.sleep(0.05)
+                self.assertFalse(handoff.done())
+                self.assertTrue(all(not task.done() for task in competitors))
+                self.assertEqual(len(self.manager.spawned), 1)
+            finally:
+                release.set()
+            response = await asyncio.wait_for(handoff, 2)
+            self.addCleanup(response.close)
+            self.assertEqual(response.status, 200)
+            await response.content.readline()
+            for task in competitors:
+                async with await asyncio.wait_for(task, 2) as conflict:
+                    self.assertEqual(conflict.status, 409)
+                    detail = await conflict.text()
+                    self.assertIn("ses_other", detail)
+                    self.assertIn("shell commands", detail)
+        self.assertEqual(len(self.manager.spawned), 2)
+        self.assertFalse(any(f["op"] == "exec" for f in runtime.process.frames))
+
+    async def test_handoff_cleanup_failure_does_not_start_replacement(self):
+        runtime = await self.runtime()
+        await self.heartbeat(runtime, processes=0)
+        with patch.object(
+            self.manager, "_kill_cgroup", side_effect=PermissionError("cgroup busy")
+        ):
+            async with await self.execute(session_id="ses_other") as response:
+                self.assertEqual(response.status, 503)
+                self.assertEqual(await response.text(), "idle runtime cleanup failed")
+        self.assertIn(runtime.runtime_id, self.manager.runtimes)
+        self.assertEqual(len(self.manager.spawned), 1)
+
+    async def test_cancelled_handoff_finishes_cleanup_before_replacement(self):
+        runtime = await self.runtime()
+        await self.heartbeat(runtime, processes=0)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_kill = self.manager._kill_cgroup
+
+        async def delayed_cleanup(old):
+            entered.set()
+            await release.wait()
+            await original_kill(old)
+
+        with patch.object(self.manager, "_kill_cgroup", delayed_cleanup):
+            handoff = asyncio.create_task(
+                self.manager._get_runtime(str(self.root), "ses_other")
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                handoff.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await handoff
+                async with await self.execute(session_id="ses_third") as response:
+                    self.assertEqual(response.status, 409)
+                    self.assertIn("runtime is stopping", await response.text())
+                self.assertEqual(len(self.manager.spawned), 1)
+            finally:
+                release.set()
+            await self.eventually(
+                lambda: runtime.runtime_id not in self.manager.runtimes
+            )
+        async with await self.execute(session_id="ses_third") as response:
+            self.assertEqual(response.status, 200)
+            await response.read()
+
+    async def test_busy_runtime_reports_handoff_blocker(self):
+        runtime = await self.runtime()
+        for fields, reason in (
+            ({"processes": 1}, "background processes (including browsers)"),
+            ({"processes": 0, "ports": [8080]}, "listening ports"),
+            ({}, "waiting for the supervisor"),
+        ):
+            with self.subTest(fields=fields):
+                await self.heartbeat(runtime, **fields)
+                async with await self.execute(session_id="ses_other") as response:
+                    self.assertEqual(response.status, 409)
+                    detail = await response.text()
+                    self.assertIn("ses_one", detail)
+                    self.assertIn(reason, detail)
+                self.assertFalse(runtime.stopped)
+        for kind, reason in (
+            ("exec", "shell commands"),
+            ("mcp", "browser tool call"),
+            ("tcp", "preview connections"),
+        ):
+            with self.subTest(kind=kind):
+                request_id, _ = runtime.channel(kind)
+                try:
+                    await self.heartbeat(runtime, processes=0)
+                    async with await self.execute(session_id="ses_other") as response:
+                        self.assertEqual(response.status, 409)
+                        self.assertIn(reason, await response.text())
+                    self.assertFalse(runtime.stopped)
+                finally:
+                    runtime.channels.pop(request_id)
         self.assertEqual(len(self.manager.spawned), 1)
 
     async def test_background_work_ports_and_unknown_counts_prevent_eviction(self):
