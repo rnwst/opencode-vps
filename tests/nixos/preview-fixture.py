@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 PUBLIC = "opencode.example.com"
+DIRECTORY = "previews.example.com"
 BASIC = "Basic " + base64.b64encode(b"opencode:fakepassword").decode()
 COOKIE = "__Host-opencode-preview"
 RUNTIME = Path("/run/opencode-previews")
@@ -177,7 +178,7 @@ async def serve():
     await asyncio.Event().wait()
 
 
-def request(host=PUBLIC, path="/previews", headers=None, method="GET", body=None):
+def request(host=DIRECTORY, path="/", headers=None, method="GET", body=None):
     # The VM acts as the TLS tunnel: test the production loopback HTTP listener
     # with the public Host, without external DNS, certificates or Cloudflare.
     with closing(
@@ -213,7 +214,7 @@ def directory():
         parsed = urlsplit(link)
         entries[parsed.hostname] = {
             "login": parsed.path + "?" + parsed.query,
-            "runtime": re.search(r'action="/previews/stop/([a-f0-9]+)"', article)[1],
+            "runtime": re.search(r'action="/stop/([a-f0-9]+)"', article)[1],
             "csrf": re.search(r'name="csrf" value="([^\"]+)"', article)[1],
         }
     assert all(
@@ -258,6 +259,7 @@ def integration(wrapper, config_path, task):
     config = json.loads(Path(config_path).read_text())
     root = Path(config["workspaces_root"])
     assert config["public_host"] == PUBLIC and config["preview_domain"] == "example.com"
+    assert config["directory_host"] == DIRECTORY
     assert config["runtime_root"] == str(RUNTIME)
     assert Path(config["playwright_mcp"]).is_file()
     assert "cpu_quota" not in config
@@ -575,11 +577,13 @@ def integration(wrapper, config_path, task):
     )
     assert request()[0] == 401
     assert request(headers={"Authorization": "Basic invalid"})[0] == 401
-    assert request(path="/health")[2] == "fake OpenCode health"
-    code, headers, _ = request(path="/session")
+    assert request(host=PUBLIC, path="/health")[2] == "fake OpenCode health"
+    code, headers, _ = request(host=PUBLIC, path="/session")
     assert code == 401 and headers["X-Preview-Fixture"] == "upstream"
     code, _, body = request(
-        path="/session?directory=%2Fsrv%2Ftest", headers={"Authorization": BASIC}
+        host=PUBLIC,
+        path="/session?directory=%2Fsrv%2Ftest",
+        headers={"Authorization": BASIC},
     )
     assert code == 200
     assert json.loads(body) == {
@@ -1047,10 +1051,10 @@ def integration(wrapper, config_path, task):
     task_cookie = login(task_host, task_entry)
     content(task_host, task_cookie, "long task source")
     task_snapshot = snapshot(task_entry)
-    stop_path = "/previews/stop/" + task_entry["runtime"]
+    stop_path = "/stop/" + task_entry["runtime"]
     stop_headers = {
         "Authorization": BASIC,
-        "Origin": "https://" + PUBLIC,
+        "Origin": "https://" + DIRECTORY,
         "Content-Type": "application/x-www-form-urlencoded",
     }
     assert (
@@ -1114,7 +1118,7 @@ def integration(wrapper, config_path, task):
         for child, identity in sibling_identities.items():
             assert process_identity(child) == identity, child
         assert pool.stat().st_ino == pool_inode
-        assert request(path="/health")[2] == "fake OpenCode health"
+        assert request(host=PUBLIC, path="/health")[2] == "fake OpenCode health"
 
     def pool_events(name="memory.events"):
         return {

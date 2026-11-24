@@ -35,10 +35,11 @@ gateway = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gateway)
 
 PUBLIC = "opencode.example.com"
+DIRECTORY = "previews.example.com"
 FIRST = "preview-alpha-3000.example.com"
 SECOND = "preview-alpha-4000.example.com"
 OTHER = "preview-beta-3000.example.com"
-HOSTS = {PUBLIC, FIRST, SECOND, OTHER}
+HOSTS = {PUBLIC, DIRECTORY, FIRST, SECOND, OTHER}
 PASSWORD = "browser-fixture-only-password"
 BASIC = "Basic " + base64.b64encode(f"opencode:{PASSWORD}".encode()).decode()
 POLICY_HEADERS = {
@@ -126,6 +127,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             gateway.create_app(
                 {
                     "public_host": PUBLIC,
+                    "directory_host": DIRECTORY,
                     "preview_domain": "example.com",
                     "opencode_port": public.port,
                 },
@@ -205,6 +207,25 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             return web.Response(status=401)
         if request.host == PUBLIC and request.path == "/":
             return web.Response(text=APP, content_type="text/html")
+        if request.host == PUBLIC and request.path == "/sw.js":
+            # Reproduce OpenCode's root-scoped navigation fallback, including
+            # its interception of the old same-origin /previews directory.
+            return web.Response(
+                text="""
+                self.addEventListener('install', () => self.skipWaiting());
+                self.addEventListener('activate', event => {
+                  event.waitUntil(self.clients.claim());
+                });
+                self.addEventListener('fetch', event => {
+                  if (event.request.mode === 'navigate') {
+                    event.respondWith(new Response('<h1>OpenCode shell</h1>', {
+                      headers: {'Content-Type': 'text/html'}
+                    }));
+                  }
+                });
+                """,
+                content_type="application/javascript",
+            )
         if request.path == "/" and self.root_redirect:
             return web.Response(status=302, headers={"Location": self.root_redirect})
         if request.path in {"/", self.root_redirect}:
@@ -281,9 +302,9 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         return web.Response(status=status, headers=headers, body=body)
 
     async def forward(self, host, path, method, headers, body):
-        # Simulate cached OpenCode Basic ONLY on the public authority, even for
+        # Simulate cached Basic on the two trusted authorities, even for
         # hostile requests. A 403 must not merely result from absent credentials.
-        if host == PUBLIC:
+        if host in {PUBLIC, DIRECTORY}:
             headers["authorization"] = BASIC
         else:
             self.assertNotIn("authorization", headers)
@@ -311,7 +332,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             )
             return response.status, response_headers, body
 
-    async def context(self, mobile=False):
+    async def context(self, mobile=False, service_workers="block"):
         context = await self.browser.new_context(
             viewport={
                 "width": 390 if mobile else 1440,
@@ -319,7 +340,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             },
             is_mobile=mobile,
             has_touch=mobile,
-            service_workers="block",
+            service_workers=service_workers,
         )
         self.addAsyncCleanup(context.close)
         context.set_default_timeout(10000)
@@ -412,7 +433,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         self.assertEqual(self.upstream_requests, [])
         self.assertEqual(await context.cookies(), [])
-        response = await page.goto(f"https://{PUBLIC}/previews")
+        response = await page.goto(f"https://{DIRECTORY}/")
         self.assertEqual(response.status, 200)
         await expect(
             page.get_by_role("heading", name="OpenCode previews")
@@ -435,6 +456,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request["headers"]["sec-fetch-site"], "same-site")
         self.assertEqual(await context.cookies(f"https://{SECOND}/"), [])
         self.assertEqual(await context.cookies(f"https://{PUBLIC}/"), [])
+        self.assertEqual(await context.cookies(f"https://{DIRECTORY}/"), [])
         self.assertEqual(self.external_requests, [])
 
     async def test_desktop_directory_login(self):
@@ -454,24 +476,22 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         # Let Chromium send the form through real HTTPS without interception.
         await context.unroute("**/*", self.edge)
         page = await context.new_page()
-        response = await page.goto(f"https://{PUBLIC}/previews")
+        response = await page.goto(f"https://{DIRECTORY}/")
         self.assertEqual(response.status, 200)
         await expect(page.locator("article")).to_have_count(3)
-        async with page.expect_response(
-            f"https://{PUBLIC}/previews/stop/alpha"
-        ) as submitted:
+        async with page.expect_response(f"https://{DIRECTORY}/stop/alpha") as submitted:
             await (
-                page.locator('form[action="/previews/stop/alpha"]')
+                page.locator('form[action="/stop/alpha"]')
                 .first.get_by_role("button", name="Stop / reset session")
                 .click()
             )
         response = await submitted.value
         headers = await response.request.all_headers()
-        self.assertEqual(headers["origin"], f"https://{PUBLIC}")
+        self.assertEqual(headers["origin"], f"https://{DIRECTORY}")
         self.assertEqual(response.request.method, "POST")
         self.assertEqual(response.status, 303)
-        self.assertEqual(response.headers["location"], "/previews")
-        await expect(page).to_have_url(f"https://{PUBLIC}/previews")
+        self.assertEqual(response.headers["location"], "/")
+        await expect(page).to_have_url(f"https://{DIRECTORY}/")
         await expect(page.locator("article")).to_have_count(1)
         await expect(page.get_by_role("heading", name="workspace beta")).to_be_visible()
         self.assertEqual(self.manager.stopped, ["alpha"])
@@ -487,6 +507,39 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_mobile_directory_stop(self):
         await self.directory_stop(mobile=True)
 
+    async def test_opencode_service_worker_cannot_intercept_directory(self):
+        context = await self.context(service_workers="allow")
+        await context.unroute("**/*", self.edge)
+        page = await context.new_page()
+        await page.goto(f"https://{PUBLIC}/")
+        await page.evaluate("""async () => {
+          await navigator.serviceWorker.register('/sw.js');
+          await navigator.serviceWorker.ready;
+          if (!navigator.serviceWorker.controller) {
+            await new Promise(resolve => navigator.serviceWorker.addEventListener(
+              'controllerchange', resolve, {once: true}));
+          }
+        }""")
+        response = await page.goto(f"https://{PUBLIC}/previews")
+        self.assertTrue(response.from_service_worker)
+        await expect(page.get_by_role("heading", name="OpenCode shell")).to_be_visible()
+        response = await page.goto(f"https://{DIRECTORY}/")
+        self.assertFalse(response.from_service_worker)
+        await expect(
+            page.get_by_role("heading", name="OpenCode previews")
+        ).to_be_visible()
+        self.assertTrue(
+            await page.evaluate("navigator.serviceWorker.controller === null")
+        )
+        await self.open_preview(context, page, FIRST)
+        await (
+            page.locator('form[action="/stop/alpha"]')
+            .first.get_by_role("button")
+            .click()
+        )
+        await expect(page.locator("article")).to_have_count(1)
+        self.assertEqual(self.manager.stopped, ["alpha"])
+
     async def test_browser_origin_isolation_and_same_runtime_cors(self):
         context = await self.context()
         public = await context.new_page()
@@ -495,11 +548,17 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         result = await public.evaluate("probe('/mutate', 'POST')")
         self.assertEqual(result["status"], 200)
         directory = await context.new_page()
-        await directory.goto(f"https://{PUBLIC}/previews")
+        await directory.goto(f"https://{DIRECTORY}/")
         pages = {}
         for host in (FIRST, SECOND, OTHER):
             pages[host] = await self.open_preview(context, directory, host)
-        for host, method in ((OTHER, "GET"), (OTHER, "POST"), (PUBLIC, "POST")):
+        for host, method in (
+            (OTHER, "GET"),
+            (OTHER, "POST"),
+            (PUBLIC, "POST"),
+            (DIRECTORY, "GET"),
+            (DIRECTORY, "POST"),
+        ):
             with self.subTest(host=host, method=method):
                 before = len(self.upstream_requests)
                 start = len(self.edge_requests)
@@ -520,7 +579,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(
                     "access-control-allow-origin", denied["response_headers"]
                 )
-                if host == PUBLIC:
+                if host in {PUBLIC, DIRECTORY}:
                     self.assertEqual(denied["headers"]["authorization"], BASIC)
                 else:
                     self.assertIn(

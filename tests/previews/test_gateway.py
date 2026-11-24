@@ -35,6 +35,7 @@ gateway = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gateway)
 
 PUBLIC = "opencode.example.com"
+DIRECTORY = "previews.example.com"
 FIRST = "preview-work-3000.example.com"
 SECOND = "preview-work-4000.example.com"
 OTHER = "preview-other-3000.example.com"
@@ -105,6 +106,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.manager = FakeManager(self.socket)
         self.config = {
             "public_host": PUBLIC,
+            "directory_host": DIRECTORY,
             "preview_domain": "example.com",
             "opencode_port": self.public_backend.port,
         }
@@ -216,7 +218,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
     def headers(self, host=FIRST, auth=True, **extra):
         headers = {"Host": host}
-        if auth and host != PUBLIC:
+        if auth and host not in {PUBLIC, DIRECTORY}:
             headers["Cookie"] = (
                 gateway.COOKIE + "=" + self.manager.lookup(host)["token"]
             )
@@ -283,12 +285,12 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 + base64.b64encode(("other:" + PASSWORD).encode()).decode()
             },
         ):
-            response = await self.request("/previews", host=PUBLIC, headers=headers)
+            response = await self.request("/", host=DIRECTORY, headers=headers)
             self.assertEqual(response.status, 401)
             self.assertIn("Basic", response.headers["WWW-Authenticate"])
             self.assertEqual(response.headers["Cache-Control"], "no-store")
         response = await self.request(
-            "/previews", host=PUBLIC, headers={"Authorization": BASIC}
+            "/", host=DIRECTORY, headers={"Authorization": BASIC}
         )
         text = await response.text()
         self.assertEqual(response.status, 200)
@@ -300,50 +302,93 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
         self.manager.entries.clear()
         response = await self.request(
-            "/previews", host=PUBLIC, headers={"Authorization": BASIC}
+            "/", host=DIRECTORY, headers={"Authorization": BASIC}
         )
         self.assertIn("ordinary server command", await response.text())
 
+    async def test_directory_is_separate_from_opencode_and_has_no_app_fallback(self):
+        for path in ("/", "/previews", "/previews/stop/one", "/sw.js"):
+            response = await self.request(path, host=PUBLIC)
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["path"], path)
+            self.assertNotIn("Location", response.headers)
+        self.requests.clear()
+        for path in ("/previews", "/sw.js", "/api", "/__preview_login?token=wrong"):
+            response = await self.request(
+                path, host=DIRECTORY, headers={"Authorization": BASIC}
+            )
+            self.assertEqual(response.status, 404)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(self.requests, [])
+        response = await self.request(
+            "/",
+            host=DIRECTORY,
+            headers={
+                "Cookie": gateway.COOKIE + "=" + self.manager.lookup(FIRST)["token"]
+            },
+        )
+        self.assertEqual(response.status, 401)
+        for host in (PUBLIC, FIRST, "evil.example.com"):
+            response = await self.request(
+                "/",
+                host=DIRECTORY,
+                headers={"Authorization": BASIC, "Origin": "https://" + host},
+            )
+            self.assertEqual(response.status, 403)
+        response = await self.request(
+            "/",
+            host=DIRECTORY,
+            headers={"Authorization": BASIC, "Origin": "https://" + DIRECTORY},
+        )
+        self.assertEqual(response.status, 200)
+
+    def test_directory_requires_a_separate_hostname(self):
+        with self.assertRaisesRegex(ValueError, "own hostname"):
+            gateway.create_app(
+                {**self.config, "directory_host": PUBLIC}, self.manager, PASSWORD
+            )
+
     async def test_stop_requires_basic_exact_origin_csrf_and_known_runtime(self):
         response = await self.request(
-            "/previews", host=PUBLIC, headers={"Authorization": BASIC}
+            "/", host=DIRECTORY, headers={"Authorization": BASIC}
         )
         csrf = re.search(r'name="csrf" value="([^"]+)"', await response.text()).group(1)
         for headers, token, expected in [
-            ({"Origin": "https://" + PUBLIC}, csrf, 401),
+            ({"Origin": "https://" + DIRECTORY}, csrf, 401),
             ({"Authorization": BASIC}, csrf, 403),
             ({"Authorization": BASIC, "Origin": "null"}, csrf, 403),
             ({"Authorization": BASIC, "Origin": "https://" + FIRST}, csrf, 403),
-            ({"Authorization": BASIC, "Origin": "https://" + PUBLIC}, "wrong", 403),
+            ({"Authorization": BASIC, "Origin": "https://" + PUBLIC}, csrf, 403),
+            ({"Authorization": BASIC, "Origin": "https://" + DIRECTORY}, "wrong", 403),
         ]:
             response = await self.request(
-                "/previews/stop/one",
-                host=PUBLIC,
+                "/stop/one",
+                host=DIRECTORY,
                 method="POST",
                 headers=headers,
                 data={"csrf": token},
             )
             self.assertEqual(response.status, expected)
             self.assertEqual(self.manager.stopped, [])
-        headers = {"Authorization": BASIC, "Origin": "https://" + PUBLIC}
+        headers = {"Authorization": BASIC, "Origin": "https://" + DIRECTORY}
         response = await self.request(
-            "/previews/stop/absent",
-            host=PUBLIC,
+            "/stop/absent",
+            host=DIRECTORY,
             method="POST",
             headers=headers,
             data={"csrf": csrf},
         )
         self.assertEqual(response.status, 404)
         response = await self.request(
-            "/previews/stop/one",
-            host=PUBLIC,
+            "/stop/one",
+            host=DIRECTORY,
             method="POST",
             headers=headers,
             data={"csrf": csrf},
         )
         self.assertEqual(response.status, 303)
         self.assertEqual(self.manager.stopped, ["one"])
-        self.assertEqual(response.headers["Location"], "/previews")
+        self.assertEqual(response.headers["Location"], "/")
 
     async def test_login_reusable_capability_flags_and_mapping_invalidation(self):
         token = self.manager.lookup(FIRST)["token"]
@@ -488,7 +533,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (
                 await self.request(
-                    "/previews", host=PUBLIC, headers={**nav, "Authorization": BASIC}
+                    "/", host=DIRECTORY, headers={**nav, "Authorization": BASIC}
                 )
             ).status,
             200,
@@ -691,6 +736,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             )
         for location in (
             "https://" + PUBLIC + "/",
+            "https://" + DIRECTORY + "/",
             "//" + SECOND + "/",
             "/\\" + PUBLIC + "/",
         ):
@@ -858,8 +904,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual((await response.json())["path"], "/control")
                 response = await self.client.get(
-                    f"http://127.0.0.1:{port}/previews",
-                    headers={"Host": PUBLIC, "Authorization": BASIC},
+                    f"http://127.0.0.1:{port}/",
+                    headers={"Host": DIRECTORY, "Authorization": BASIC},
                 )
                 self.assertEqual(response.status, 200)
                 self.assertNotIn(PASSWORD, str(os.environ))

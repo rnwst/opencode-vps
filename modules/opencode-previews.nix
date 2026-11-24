@@ -20,6 +20,24 @@ in
         message = "previews.domain must be a lowercase DNS domain.";
       }
       {
+        assertion =
+          builtins.stringLength cfg.directoryHost <= 253
+          && builtins.length (lib.splitString "." cfg.directoryHost) > 1
+          && lib.all (
+            label:
+            builtins.stringLength label <= 63 && builtins.match "[a-z0-9]([a-z0-9-]*[a-z0-9])?" label != null
+          ) (lib.splitString "." cfg.directoryHost);
+        message = "previews.directoryHost must be a lowercase DNS hostname.";
+      }
+      {
+        assertion =
+          cfg.directoryHost != settings.publicHostName
+          && !(
+            lib.hasPrefix "preview-" cfg.directoryHost && lib.hasSuffix ".${cfg.domain}" cfg.directoryHost
+          );
+        message = "previews.directoryHost must be distinct from OpenCode and application preview hostnames.";
+      }
+      {
         assertion = cfg.runtimeRoot == "/run/opencode-previews";
         message = "Preview control paths must use the protected systemd runtime directory.";
       }

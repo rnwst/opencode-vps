@@ -170,6 +170,10 @@ class Gateway:
         self.manager = manager
         self.password = password
         self.public_host = setting(config, "public_host").lower()
+        self.directory_host = setting(config, "directory_host").lower()
+        if self.directory_host == self.public_host:
+            raise ValueError("Preview directory must have its own hostname")
+        self.control_hosts = {self.public_host, self.directory_host}
         self.csrf = secrets.token_urlsafe(32)
 
     def origin_policy(self, request, host, entry=None):
@@ -197,7 +201,7 @@ class Gateway:
         # Preview documents can use any path, but still require their host cookie.
         navigation = (
             request.method == "GET"
-            and (entry is not None or request.path in {"/", "/previews"})
+            and (entry is not None or request.path == "/")
             and request.headers.get("Sec-Fetch-Mode") == "navigate"
             and request.headers.get("Sec-Fetch-Dest") == "document"
         )
@@ -229,8 +233,8 @@ class Gateway:
         host = host_of(request)
         if not host:
             raise web.HTTPNotFound(text="Not found")
-        entry = None if host == self.public_host else self.manager.lookup(host)
-        if host != self.public_host and not entry:
+        entry = None if host in self.control_hosts else self.manager.lookup(host)
+        if host not in self.control_hosts and not entry:
             raise web.HTTPNotFound(text="Not found")
         if request.content_length is not None and request.content_length > MAX_BODY:
             raise web.HTTPRequestEntityTooLarge(
@@ -249,9 +253,9 @@ class Gateway:
         allowed, cors_origin = self.origin_policy(request, host, entry)
         if not allowed:
             raise web.HTTPForbidden(text="Forbidden")
+        if host == self.directory_host:
+            return await self.directory(request)
         if host == self.public_host:
-            if request.path == "/previews" or request.path.startswith("/previews/"):
-                return await self.directory(request)
             return await self.proxy(request, host)
         if (
             request.method == "OPTIONS"
@@ -321,23 +325,23 @@ class Gateway:
                     "WWW-Authenticate": 'Basic realm="OpenCode previews", charset="UTF-8"'
                 },
             )
-        if request.path.startswith("/previews/stop/") and request.method == "POST":
-            if request.headers.get("Origin") != "https://" + self.public_host:
+        if request.path.startswith("/stop/") and request.method == "POST":
+            if request.headers.get("Origin") != "https://" + self.directory_host:
                 raise web.HTTPForbidden(text="Forbidden")
             if request.content_length is None or request.content_length > 4096:
                 raise web.HTTPForbidden(text="Forbidden")
             form = await request.post()
             if not equal(form.get("csrf"), self.csrf):
                 raise web.HTTPForbidden(text="Forbidden")
-            runtime_id = request.path[len("/previews/stop/") :]
+            runtime_id = request.path[len("/stop/") :]
             if not any(
                 item["runtime_id"] == runtime_id
                 for item in self.manager.list_previews()
             ):
                 raise web.HTTPNotFound(text="Not found")
             await self.manager.stop(runtime_id)
-            return web.Response(status=303, headers={"Location": "/previews"})
-        if request.path != "/previews":
+            return web.Response(status=303, headers={"Location": "/"})
+        if request.path != "/":
             raise web.HTTPNotFound(text="Not found")
         if request.method != "GET":
             raise web.HTTPMethodNotAllowed(request.method, ["GET"])
@@ -368,7 +372,7 @@ class Gateway:
                 + ("Available" if available else "Unavailable")
                 + '</p></div><div class="actions">'
                 + link
-                + '<form method="post" action="/previews/stop/'
+                + '<form method="post" action="/stop/'
                 + quote(entry["runtime_id"], safe="")
                 + '"><input type="hidden" name="csrf" value="'
                 + esc(self.csrf)
@@ -385,7 +389,7 @@ a{color:#075a72}button{margin-top:1rem;padding:.6rem;border:1px solid #697b83;ba
 header{border-color:#e4e9ed}article{border-color:#46545f}a{color:#7dd3e8}
 button{color:#e4e9ed;background:#25323e;border-color:#879ba5}}
 @media(max-width:600px){article{display:block}.actions{margin-top:1rem}}</style>
-<main><header><h1>OpenCode previews</h1><p>Persistent development sessions. <a href="/previews">Refresh</a></p></header>"""
+<main><header><h1>OpenCode previews</h1><p>Persistent development sessions. <a href="/">Refresh</a></p></header>"""
         body += (
             "".join(rows)
             if rows
@@ -415,7 +419,7 @@ button{color:#e4e9ed;background:#25323e;border-color:#879ba5}}
                         ("https", host, parsed.path, parsed.query, parsed.fragment)
                     )
                 elif target and (
-                    target == self.public_host or self.manager.lookup(target)
+                    target in self.control_hosts or self.manager.lookup(target)
                 ):
                     del headers["Location"]
                     # A preview must not trigger authenticated control-plane navigation.
@@ -623,13 +627,14 @@ def create_app(config, manager, password):
         except Exception:  # noqa: BLE001 - exceptions can contain bearer URLs
             response = web.Response(status=502, text="Upstream unavailable")
         host = host_of(request)
-        if host and host != gateway.public_host:
-            preview_headers(response.headers)
-        elif request.path == "/previews" or request.path.startswith("/previews/"):
+        if host == gateway.directory_host:
             response.headers["Cache-Control"] = "no-store"
             # no-referrer makes native form POSTs send Origin: null.
             response.headers["Referrer-Policy"] = "same-origin"
             response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+            response.headers["X-Frame-Options"] = "DENY"
+        elif host and host != gateway.public_host:
+            preview_headers(response.headers)
         return response
 
     # Preserve encoded request bytes and Content-Length together. Decompressing

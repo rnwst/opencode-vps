@@ -1,13 +1,17 @@
 { lib, settings }:
+let
+  publicDomain = lib.concatStringsSep "." (
+    lib.tail (lib.splitString "." (settings.publicHostName or "opencode.example.com"))
+  );
+in
 assert lib.assertMsg (
   !((settings.previews or { }) ? cpuQuota)
 ) "previews.cpuQuota is no longer supported; runtimes use weighted CPU sharing.";
 {
   enable = true;
   # Keep deployment domains in the local settings override, not this template.
-  domain = lib.concatStringsSep "." (
-    lib.tail (lib.splitString "." (settings.publicHostName or "opencode.example.com"))
-  );
+  domain = publicDomain;
+  directoryHost = "previews.${publicDomain}";
   gatewayPort = 4080;
   runtimeRoot = "/run/opencode-previews";
   maxRuntimes = 4;

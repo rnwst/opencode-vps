@@ -82,9 +82,9 @@ curl --noproxy '*' http://127.0.0.1:3000/
 - Use `OPENCODE_PREVIEW_URL_TEMPLATE`, replacing `{port}`, only when the app
   needs its public address for allowed-host configuration, HMR, or cross-port
   browser requests. Test locally through session loopback.
-- When telling the user where to view a preview, direct them to `/previews` on
-  their OpenCode server, not the app's public URL, which may return "Forbidden"
-  before authentication.
+- When telling the user where to view a preview, direct them to
+  `@PREVIEW_DIRECTORY_URL@`. Use its login links to open applications; a direct
+  app URL may return "Forbidden" before authentication.
 - Configure the exact public hostname in the dev server's allowed-host list.
   HMR may need the public HTTPS/WSS address and client port 443. Do not disable
   host or origin checks globally.

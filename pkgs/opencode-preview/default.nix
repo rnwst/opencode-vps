@@ -23,6 +23,7 @@ let
   configFile = pkgs.writeText "opencode-previews.json" (
     builtins.toJSON {
       public_host = settings.publicHostName or "opencode.example.com";
+      directory_host = cfg.directoryHost;
       preview_domain = cfg.domain;
       opencode_port = settings.opencodePort;
       listen_port = cfg.gatewayPort;

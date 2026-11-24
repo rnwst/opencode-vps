@@ -73,9 +73,16 @@ let
   );
 
   agentsFile = pkgs.writeText "opencode-AGENTS.md" (
-    builtins.replaceStrings [ "@GITHUB_REVIEWER@" ] [ "@${settings.githubReviewer}" ] (
-      builtins.readFile ../config/AGENTS.md
-    )
+    builtins.replaceStrings
+      [
+        "@GITHUB_REVIEWER@"
+        "@PREVIEW_DIRECTORY_URL@"
+      ]
+      [
+        "@${settings.githubReviewer}"
+        "https://${previewCfg.directoryHost}/"
+      ]
+      (builtins.readFile ../config/AGENTS.md)
   );
   tunnelEnabled = settings.cloudflareTunnelId != null;
 in
@@ -175,6 +182,7 @@ in
         }";
       }
       // lib.optionalAttrs previewCfg.enable {
+        ${previewCfg.directoryHost} = "http://127.0.0.1:${toString previewCfg.gatewayPort}";
         "*.${previewCfg.domain}" = "http://127.0.0.1:${toString previewCfg.gatewayPort}";
       };
     };
