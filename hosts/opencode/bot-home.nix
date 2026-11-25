@@ -1,7 +1,5 @@
 { pkgs, settings, ... }:
 {
-  imports = [ ./development-home.nix ];
-
   home = {
     username = settings.accounts.bot.name;
     homeDirectory = "/home/${settings.accounts.bot.name}";

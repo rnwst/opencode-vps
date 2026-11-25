@@ -23,10 +23,9 @@ let
     inherit pkgs;
     extraSpecialArgs = { inherit settings; };
     modules = [
-      ../../hosts/opencode/home.nix
+      ../../hosts/opencode/bot-home.nix
       {
         # Exercise the production Git module without installing development tools.
-        disabledModules = [ ../../hosts/opencode/development-home.nix ];
         programs.git.enable = true;
       }
     ];

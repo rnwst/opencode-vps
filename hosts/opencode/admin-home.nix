@@ -1,7 +1,5 @@
 { settings, ... }:
 {
-  imports = [ ./development-home.nix ];
-
   home = {
     username = settings.accounts.admin.name;
     homeDirectory = "/home/${settings.accounts.admin.name}";

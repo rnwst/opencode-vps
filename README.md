@@ -357,9 +357,9 @@ back to the mapped session explicitly:
 | `hosts/opencode/default.nix`                | Host, users, SSH, firewall, boot, and Home Manager                |
 | `hosts/opencode/disko.nix`                  | Destructive disk partitioning and filesystems                     |
 | `hosts/opencode/hardware-configuration.nix` | Hardware defaults, replaced during deployment                     |
-| `hosts/opencode/development-home.nix`       | Shared development tools, Fish-Helix, Helix, direnv, and prompt   |
-| `hosts/opencode/home.nix`                   | Bot-specific Git identity and HTTPS credential helper             |
+| `hosts/opencode/bot-home.nix`               | Bot-specific Git identity and HTTPS credential helper             |
 | `hosts/opencode/admin-home.nix`             | Administrator identity plus `og` and `oca` operator helpers       |
+| `modules/development.nix`                  | System-wide development tools and shared Home Manager settings   |
 | `modules/opencode.nix`                      | Managed OpenCode, systemd credentials, and Cloudflare Tunnel      |
 | `modules/opencode-previews.nix`             | Loopback preview gateway, persistent runtime service, delegation  |
 | `modules/github-bridge.nix`                 | GitHub polling, credentials, queue activation, and service policy |
@@ -1498,9 +1498,10 @@ provider after validation.
 ## Adding Development Tooling
 
 Add stable command-line tools and language servers to
-`hosts/opencode/development-home.nix`, which is shared by the administrator and
-bot. Add a fast-moving tool to the unstable package set only when there is a
-concrete need; keep the stable base and no-unfree policy.
+`environment.systemPackages` in `modules/development.nix`. This module also
+provides shared Home Manager settings for the administrator and bot through
+`home-manager.sharedModules`. Add a fast-moving tool to the unstable package set
+only when there is a concrete need; keep the stable base and no-unfree policy.
 OpenCode's automatic LSP downloads are disabled, so every required server must
 be present in the Nix profile and any custom extension mapping belongs in
 `modules/opencode.nix`.

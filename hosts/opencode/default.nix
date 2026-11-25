@@ -178,7 +178,7 @@
     extraSpecialArgs = {
       inherit inputs localPackages settings;
     };
-    users.${settings.accounts.bot.name} = import ./home.nix;
+    users.${settings.accounts.bot.name} = import ./bot-home.nix;
     users.${settings.accounts.admin.name} = import ./admin-home.nix;
   };
 
